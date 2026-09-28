@@ -3,6 +3,7 @@ import { onMount } from "solid-js"
 import { createStore, produce, unwrap } from "solid-js/store"
 import type { PromptInput } from "@opencode/schema"
 import type { Types } from "effect"
+import type { PromptCompletionAnnotation } from "@opencode/plugin/tui/context"
 import { createSimpleContext } from "../context/helper"
 import { useTuiPaths } from "../context/runtime"
 import { appendText, readText, writeText } from "../util/persistence"
@@ -18,6 +19,7 @@ export type PastedText = {
 
 export type PromptInfo = Types.DeepMutable<Pick<PromptInput.Prompt, "text" | "files" | "agents" | "skills">> & {
   pasted: PastedText[]
+  annotations?: PromptCompletionAnnotation[]
   mode?: "normal" | "shell"
 }
 
@@ -26,7 +28,14 @@ export type PromptPartRef = {
   index: number
 }
 
-export const emptyPrompt = (): PromptInfo => ({ text: "", files: [], agents: [], skills: [], pasted: [] })
+export const emptyPrompt = (): PromptInfo => ({
+  text: "",
+  files: [],
+  agents: [],
+  skills: [],
+  pasted: [],
+  annotations: [],
+})
 
 export const MAX_HISTORY_ENTRIES = 50
 

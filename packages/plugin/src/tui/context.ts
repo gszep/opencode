@@ -1,4 +1,5 @@
 import type {
+  JsonValue,
   AgentInfo,
   CommandInfo,
   SessionFormCancelInput,
@@ -503,6 +504,35 @@ export interface UI {
   readonly slot: (claim: SlotClaim) => () => void
 }
 
+export interface PromptCompletionItem {
+  readonly id: string
+  /** Text after @, inserted literally without an attachment or agent invocation. */
+  readonly value: string
+  readonly description?: string
+  readonly data?: JsonValue
+}
+
+export interface PromptCompletionAnnotation {
+  readonly provider: string
+  readonly id: string
+  readonly data?: JsonValue
+  readonly mention: { readonly start: number; readonly end: number; readonly text: string }
+}
+
+export interface PromptCompletionInput {
+  /** The current token after @. */
+  readonly query: string
+  readonly location: LocationRef
+  readonly sessionID?: string
+  readonly signal: AbortSignal
+}
+
+export interface PromptCompletionProvider {
+  /** Unique within this plugin activation. */
+  readonly id: string
+  complete(input: PromptCompletionInput): readonly PromptCompletionItem[] | Promise<readonly PromptCompletionItem[]>
+}
+
 export interface Context {
   readonly options: Readonly<Record<string, any>>
   readonly location: LocationRef | undefined
@@ -517,6 +547,12 @@ export interface Context {
     registerCodeBlockRenderer(language: string, render: MarkdownCodeBlockRenderer): () => void
   }
   readonly keymap: Keymap
+  readonly prompt: {
+    readonly completions: {
+      /** Adds plain-text @ completions to the full TUI. Automatically removed on plugin unload. */
+      register(provider: PromptCompletionProvider): () => void
+    }
+  }
   readonly storage: Storage
   readonly ui: UI
 }

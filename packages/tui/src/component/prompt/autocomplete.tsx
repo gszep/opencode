@@ -26,6 +26,10 @@ import { stringWidth } from "../../util/string-width"
 import { parseFileLineRange, stripFileLineRange } from "../../prompt/parse"
 import { moveSelection, reconcileSelectionWindow, revealSelectionOffset } from "../../ui/select-controller"
 import { directoryAutocomplete, slashArgumentAutocomplete } from "../../prompt/directory-completion"
+import { createPromptCompletions, insertPromptCompletion } from "../../prompt/completions"
+import { usePlugin } from "../../plugin/context"
+import { readCompletionAnnotations, restoreCompletionAnnotations } from "../../prompt/annotations"
+import { promptOffsetWidth } from "../../prompt/display"
 
 export type AutocompleteRef = {
   onInput: (value: string) => void
@@ -34,6 +38,7 @@ export type AutocompleteRef = {
 }
 
 export type AutocompleteOption = {
+  id?: string
   display: string
   value?: string
   aliases?: string[]
@@ -58,6 +63,7 @@ type AutocompleteResults = {
 
 export function Autocomplete(props: {
   value: string
+  plainPrompt: boolean
   sessionID?: string
   argumentAutocomplete?: (command: KeymapCommand) => "directory" | undefined
   directoryOptions?: (query: string) => AutocompleteOption[]
@@ -83,6 +89,7 @@ export function Autocomplete(props: {
   const config = useConfig().data
   const paths = useTuiPaths()
   const location = useLocation()
+  const plugins = usePlugin()
   const [store, setStore] = createStore({
     index: 0,
     selected: 0,
@@ -92,6 +99,7 @@ export function Autocomplete(props: {
   const [positionTick, setPositionTick] = createSignal(0)
   const [dismissedValue, setDismissedValue] = createSignal<string>()
   const [confirming, setConfirming] = createSignal<string>()
+  const [selectedID, setSelectedID] = createSignal<string>()
 
   createEffect(() => {
     if (!store.visible) return
@@ -310,15 +318,45 @@ export function Autocomplete(props: {
   }
 
   function insertDirectory(directory: string) {
-    const input = props.input()
-    const cursorOffset = input.cursorOffset
-    input.cursorOffset = store.index
-    const start = input.logicalCursor
-    input.cursorOffset = cursorOffset
-    const end = input.logicalCursor
-    input.deleteRange(start.row, start.col, end.row, end.col)
-    input.insertText(directory)
+    insertPromptCompletion(props.input(), store.index, directory)
   }
+
+  const completions = createPromptCompletions(plugins.completions, () =>
+    store.visible === "reference" && props.plainPrompt
+      ? {
+          query: search(),
+          location: location.current ?? { directory: paths.cwd },
+          sessionID: props.sessionID,
+        }
+      : undefined,
+  )
+  const pluginOptions = createMemo((): AutocompleteOption[] =>
+    completions().map((item) => ({
+      id: JSON.stringify([item.provider, item.id]),
+      display: "@" + item.value,
+      description: item.description,
+      onSelect: () => {
+        const space = displayCharAt(props.value, props.input().cursorOffset) === " " ? "" : " "
+        insertPromptCompletion(props.input(), store.index, "@" + item.value + space)
+        restoreCompletionAnnotations(props.input(), [
+          {
+            provider: item.provider,
+            id: item.id,
+            ...(item.data === undefined ? {} : { data: item.data }),
+            mention: {
+              start: store.index,
+              end: store.index + promptOffsetWidth("@" + item.value),
+              text: "@" + item.value,
+            },
+          },
+        ])
+        props.setPrompt((draft) => {
+          draft.text = props.input().plainText
+          draft.annotations = readCompletionAnnotations(props.input())
+        })
+      },
+    })),
+  )
 
   const [files] = createResource(
     () => ({ query: search(), location: location.current, visible: store.visible }),
@@ -519,7 +557,6 @@ export function Autocomplete(props: {
 
   const options = createMemo(() => {
     const fileSearch = visibleFiles()
-    const referenceMatchValue = referenceMatch()
     const agentsValue = agents()
     const referenceAliasesValue = referenceAliases()
     const commandsValue = commands()
@@ -529,10 +566,6 @@ export function Autocomplete(props: {
       const supplemental = supplementalDirectoryOptions()
       const paths = new Set(supplemental.map((item) => item.absolute))
       return [...supplemental, ...fileSearch.options.filter((item) => !paths.has(item.absolute))]
-    }
-
-    if (store.visible === "reference" && referenceMatchValue) {
-      return referenceAliasesValue.filter((item) => item.display === `@${referenceMatchValue.name}`)
     }
 
     // Files come from fff already fuzzy ranked and filtered
@@ -546,7 +579,7 @@ export function Autocomplete(props: {
           : []
 
     if (!searchValue) {
-      return [...nonFileOptions, ...fileOptions]
+      return [...nonFileOptions, ...(store.visible === "reference" ? pluginOptions() : []), ...fileOptions]
     }
 
     const fuzziedNonFiles = fuzzysort
@@ -572,13 +605,36 @@ export function Autocomplete(props: {
       })
       .map((arr) => arr.obj)
 
-    return [...fuzziedNonFiles, ...fileOptions].slice(0, 10)
+    // Providers own matching (for example prefix-only people directories). Rank all
+    // matching sources together before truncating, retaining search order on ties.
+    const candidates = [...fuzziedNonFiles, ...(store.visible === "reference" ? pluginOptions() : []), ...fileOptions]
+    const query = searchValue.toLowerCase()
+    const rank = (item: AutocompleteOption) => {
+      const value = (item.value ?? item.display).trim().replace(/^@/, "").toLowerCase()
+      return value === query ? 0 : value.startsWith(query) ? 1 : 2
+    }
+    const ranked = candidates.toSorted((a, b) => rank(a) - rank(b))
+    const visible = ranked.slice(0, 10)
+    const chosen = selectedID()
+    const retained = chosen === undefined ? undefined : ranked.find((item) => optionID(item) === chosen)
+    return retained && !visible.includes(retained) ? [...visible.slice(0, 9), retained] : visible
   })
 
   createEffect(() => {
     filter()
+    setSelectedID(undefined)
     setStore("selected", 0)
     setConfirming(undefined)
+  })
+
+  const optionID = (item: AutocompleteOption) =>
+    item.id ?? JSON.stringify([item.kind ?? "file", item.absolute ?? item.path ?? item.value ?? item.display])
+  createEffect(() => {
+    const list = options()
+    const id = selectedID()
+    const index = id === undefined ? 0 : list.findIndex((item) => optionID(item) === id)
+    if (index < 0) setSelectedID(undefined)
+    setStore("selected", Math.max(0, index))
   })
 
   function move(direction: -1 | 1) {
@@ -588,6 +644,8 @@ export function Autocomplete(props: {
   }
 
   function moveTo(next: number) {
+    const item = options()[next]
+    if (item) setSelectedID(optionID(item))
     if (next !== store.selected) setConfirming(undefined)
     setStore("selected", next)
     if (!scroll) return
@@ -609,7 +667,7 @@ export function Autocomplete(props: {
     })
     if (selected === store.selected) return
     setConfirming(undefined)
-    setStore("selected", selected)
+    moveTo(selected)
   }
 
   function select() {
@@ -618,9 +676,11 @@ export function Autocomplete(props: {
     if (store.visible !== "directory") {
       hide(true)
       selected.onSelect?.()
+      props.input().focus()
       return
     }
     selected.onSelect?.()
+    props.input().focus()
     setDismissedValue(props.input().plainText)
     hide(true)
   }
@@ -742,6 +802,7 @@ export function Autocomplete(props: {
   }
 
   function hide(removeToken = false) {
+    setSelectedID(undefined)
     if (removeToken && store.visible === "command") {
       const input = props.input()
       const cursorOffset = input.cursorOffset
