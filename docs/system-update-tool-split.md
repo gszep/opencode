@@ -22,7 +22,9 @@ or restarted for this change.
    been emitted, preserving update order. Use that normalized sequence for native
    versus wrapped placement. Do not mutate the input, cross another conversation
    message, or manufacture results in the protocol adapter. Terminal missing
-   results remain invalid. See [#51764](https://github.com/anomalyco/opencode/issues/51764).
+   results remain invalid. Issue [#51764](https://github.com/anomalyco/opencode/issues/51764)
+   and focused upstream PR [#51765](https://github.com/anomalyco/opencode/pull/51765)
+   target `v2` at `0caae608a28819981510989d28768cd9d4e4a663`.
 
 The first defect explains overlapping executions; the second prevents already
 recoverable history from failing request compilation. The lowering fix alone
@@ -61,3 +63,17 @@ updates, terminal updates, shared missing-result repair, unchanged input, direct
 Anthropic Opus 4.8/5.5, older-model fallback, Vertex fallback, and rejection of
 missing results or movement across another conversation message. No live model
 or private session payload is part of the regression fixtures.
+
+The carried base passes 121 focused AI tests, 46 execution tests, 51 message and
+migration tests, migration schema validation, and the 35-task root check. The
+upstream candidate passes 132 focused AI tests and the 35-task root check.
+
+## Combined-build integration
+
+The delta from `aa665f75d` applies cleanly with `git apply --cached --3way` to
+`feat/plugin-prompt-completions` at `508492110` (verified in a disposable index;
+that branch was not modified). A full branch merge still inherits the original
+linkfix base's pre-existing `packages/tui/src/ui/link.tsx` conflict against newer
+upstream: preserve the modified-click guard and use upstream's `openUrl` import
+and call. This is the already documented linkfix adaptation, not a conflict in
+the system-update/recovery patch. The orchestrator owns combined-build integration.
