@@ -77,9 +77,8 @@ The separate upstream-ready `modified-link-click` branch targets V2 commit
 to current upstream's `openUrl` API. Its regression, TUI typecheck and root
 `bun run check` passed on Calcifer.
 
-No upstream PR has been opened: V2 CONTRIBUTING requires a linked existing issue
-for bug fixes. The requested stop-before-opening rule therefore applies. Searches
-for duplicate browser/OAuth tabs and modified hyperlink clicks found no matching
-issue or fix. Related PRs #40905/#40912 added authorization-link handling;
-#46261 concerns Markdown links and is not this component's fix. File a short bug
-report using the upstream template, then use that issue in the focused PR.
+After operator approval, issue anomalyco/opencode#51756 and focused PR #51757
+were opened against `v2`. The PR links a rendered before/after regression
+recording with injected mouse events and a counted browser opener; it does not
+claim native terminal/browser reproduction. Related PRs #40905/#40912 added
+authorization-link handling; #46261 concerns Markdown links, not this fix.
