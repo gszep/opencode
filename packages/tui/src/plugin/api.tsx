@@ -1,6 +1,15 @@
 import { PluginContextProvider } from "@opencode/plugin/tui"
 import type { JSX } from "solid-js"
-import type { Context, Dialog, Page, SlotClaim, SlotMap, SlotPath, Toast } from "@opencode/plugin/tui/context"
+import type {
+  Context,
+  Dialog,
+  Page,
+  PromptCompletionProvider,
+  SlotClaim,
+  SlotMap,
+  SlotPath,
+  Toast,
+} from "@opencode/plugin/tui/context"
 import type { Placement, PlacementKind } from "./structure"
 import { infoStringToFiletype, type MarkdownCodeBlockRenderer } from "@opentui/core"
 import { useRenderer } from "@opentui/solid"
@@ -42,11 +51,12 @@ const placements = ["prepend", "append", "before", "after", "replace"] as const 
 // route/slot registration lands there, but ordering and lifecycle stay owned
 // by the provider.
 export type Registry = {
-  has(kind: "routes" | "slots" | "markdown", name: string): boolean
+  has(kind: "routes" | "slots" | "markdown" | "completions", name: string): boolean
   set(kind: "routes", name: string, page: Page): void
   set(kind: "slots", name: string, claim: RegisteredSlot): void
   set(kind: "markdown", name: string, render: MarkdownCodeBlockRenderer): void
-  remove(kind: "routes" | "slots" | "markdown", name: string): void
+  set(kind: "completions", name: string, provider: PromptCompletionProvider): void
+  remove(kind: "routes" | "slots" | "markdown" | "completions", name: string): void
   active(): boolean
 }
 
@@ -122,7 +132,7 @@ export function createPluginContext(input: {
   }
   // Unregistering after deactivation is a no-op: deactivate already resets
   // the registration's routes and slots wholesale.
-  const registration = (kind: "routes" | "slots" | "markdown", name: string) => {
+  const registration = (kind: "routes" | "slots" | "markdown" | "completions", name: string) => {
     let registered = true
     const unregister = () => {
       if (!registered) return
@@ -168,6 +178,17 @@ export function createPluginContext(input: {
       pending: host.keymapState.pending,
       active: host.keymapState.active,
       mode: host.keymap.mode,
+    },
+    prompt: {
+      completions: {
+        register(provider) {
+          if (input.registry.has("completions", provider.id)) {
+            throw new Error(`Prompt completion provider already registered: ${provider.id}`)
+          }
+          input.registry.set("completions", provider.id, { ...provider, id: JSON.stringify([input.id, provider.id]) })
+          return registration("completions", provider.id)
+        },
+      },
     },
     storage: {
       store: (key, options) => host.storage.store(`plugin.${input.id}.${key}`, options),

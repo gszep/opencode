@@ -287,6 +287,46 @@ const popMode = context.keymap.mode.push("acme-search")
 popMode()
 ```
 
+## Prompt completions
+
+Add annotated text items to the full TUI's existing `@` menu. Providers filter their own results. The host ranks
+exact and prefix matches alongside built-in sources; Tab, Enter and click share acceptance. Selection inserts
+`@` plus `value` without attaching a file or invoking an agent.
+
+```ts
+context.prompt.completions.register({
+  id: "people",
+  async complete({ query, location, sessionID, signal }) {
+    const people = await directory.search({ query, location, sessionID, signal })
+    return people.map((person) => ({
+      id: person.id,
+      value: person.handle,
+      description: person.name,
+      data: { ownerId: person.id },
+    }))
+  },
+})
+```
+
+`directory.search` above is your plugin's data source. Values omit the leading `@`. The callback runs only while
+the `@` menu is open and receives the token after `@`, the current location, and the optional session ID.
+The returned disposer and plugin unload both remove the provider. Pending requests are aborted when the query,
+location, session, or registered providers change, or the menu closes. Late results are discarded even if a
+provider ignores cancellation. Failed providers contribute no items; other providers and built-ins remain usable.
+Return bounded results and pass `signal` to network requests. Mini has a separate composer and does not use this API.
+
+Item IDs are stable within the provider; the host namespaces them by plugin and provider. Each provider contributes
+at most 100 unique, whitespace-free tokens. Automatic selection follows the best-ranked available item, while explicit
+navigation preserves the selected ID as asynchronous results arrive. With the popup closed, Tab retains its normal action.
+
+The composer owns annotation ranges, including edit/undo, drafts and prompt history. Editing a token drops its
+annotation; undo restores it with the original identity. External-editor replacements retain only annotations in
+unchanged prefix/suffix text. Plain prompt submission carries the selected IDs and optional JSON `data` under
+`metadata["opencode.prompt.completions"]`, as `{ provider, id, data?, mention: { start, end, text } }` records.
+`provider` is the JSON-encoded `[pluginID, providerID]` pair; ranges are textarea display offsets (newlines count as one).
+This metadata records user selection, not authorization or permission to execute a side effect. Shell/slash commands
+do not have this metadata channel; plugin completions are intended for plain user prompts.
+
 ## Storage
 
 Durable storage persists JSON across restarts and synchronizes across TUI instances.

@@ -69,6 +69,13 @@ import { directoryRecentValue } from "../../prompt/directory-completion"
 import { useWorkingDirectoryActions } from "../../ui/working-directory-actions"
 import { truncateFilePath } from "../../ui/file-path"
 import { PromptMetadataRow } from "./metadata"
+import {
+  completionMetadata,
+  completionMetadataKey,
+  editCompletionAnnotations,
+  readCompletionAnnotations,
+  restoreCompletionAnnotations,
+} from "../../prompt/annotations"
 
 export type PromptProps = {
   sessionID?: string
@@ -557,6 +564,8 @@ export function Prompt(props: PromptProps) {
 
           const editorPrompt = expandPromptInputPastedText(store.prompt, store.prompt.pasted)
           const value = editorPrompt.text
+          const annotations =
+            completionMetadata(value, store.prompt.annotations, store.prompt.pasted)?.[completionMetadataKey] ?? []
           const content = await openEditor({
             renderer,
             value,
@@ -572,6 +581,7 @@ export function Prompt(props: PromptProps) {
 
           setStore("prompt", {
             ...realignPromptInputMentions(normalized, editorPrompt),
+            annotations: editCompletionAnnotations(value, normalized, annotations),
             pasted: [],
           })
           restoreExtmarksFromPrompt(store.prompt)
@@ -760,6 +770,8 @@ export function Prompt(props: PromptProps) {
 
   function restoreExtmarksFromPrompt(prompt: PromptInfo) {
     input.extmarks.clear()
+    setStore("prompt", "annotations", prompt.annotations ?? [])
+    restoreCompletionAnnotations(input, prompt.annotations ?? [])
     setStore("extmarkToPart", new Map())
 
     const parts = [
@@ -804,6 +816,7 @@ export function Prompt(props: PromptProps) {
   }
 
   function syncExtmarksWithPromptParts() {
+    setStore("prompt", "annotations", readCompletionAnnotations(input))
     const allExtmarks = input.extmarks.getAllForTypeId(promptPartTypeId)
     setStore(
       produce((draft) => {
@@ -1361,6 +1374,7 @@ export function Prompt(props: PromptProps) {
           skills: entry.skills?.length ? entry.skills : undefined,
           delivery,
           gate: newSession?.gate,
+          metadata: completionMetadata(inputText, entry.annotations, entry.pasted),
           // Commit the captured selection after earlier admissions, including
           // compaction setup. Cached state may still precede their SSE echoes;
           // the server makes an unchanged selection a no-op.
@@ -1964,6 +1978,7 @@ export function Prompt(props: PromptProps) {
         </box>
       </box>
       <Autocomplete
+        plainPrompt={store.mode === "normal" && !store.prompt.text.startsWith("/")}
         sessionID={props.sessionID}
         argumentAutocomplete={(command) => (command.id === "session.cd" ? "directory" : undefined)}
         directoryOptions={(query): AutocompleteOption[] => {
