@@ -19,6 +19,7 @@ import { SessionInbox } from "@opencode/core/session/inbox"
 import { InstructionState } from "@opencode/core/session/instruction-state"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionModelRequest } from "@opencode/core/session/model-request"
+import { runtimeGuidance } from "@opencode/core/session/runtime-guidance"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionProviderContext } from "@opencode/core/session/provider-context"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
@@ -285,6 +286,9 @@ it.live(
         tools: [expect.objectContaining({ name: "read" })],
       })
       expect(fixture.bodies[0]).not.toHaveProperty("context_management")
+      expect(fixture.bodies[0]?.instructions).toEqual(expect.stringContaining(runtimeGuidance))
+      expect(String(fixture.bodies[0]?.instructions).split(runtimeGuidance)).toHaveLength(2)
+      expect(JSON.stringify(fixture.bodies[0]?.input)).not.toContain(runtimeGuidance)
       expect(fixture.headers[0]?.get("x-test-hook")).toBe("compaction")
       expect(fixture.headers[0]?.get("x-http-hook")).toBe("compaction")
       yield* fixture.prompt("Second real user request")
@@ -361,6 +365,11 @@ it.live("manual and automatic endpoint compaction keep the provider replacement 
     expect(replacement[0]?.content).toEqual([Message.text("endpoint retained")])
     expect(JSON.stringify(replacement)).not.toContain("Original user")
     expect(fixture.state.calls).toBe(2)
+    for (const body of fixture.bodies) {
+      expect(body.instructions).toEqual(expect.stringContaining(runtimeGuidance))
+      expect(String(body.instructions).split(runtimeGuidance)).toHaveLength(2)
+      expect(JSON.stringify(body.input)).not.toContain(runtimeGuidance)
+    }
     expect(fixture.headers[0]?.get("x-http-hook")).toBe("compaction")
     expect(fixture.bodies[0]).not.toHaveProperty("context_management")
   }),
