@@ -49,9 +49,21 @@ test("standalone interrupt cancels one original orphan without running startup r
       for (const id of ["ses_stop_original", "ses_do_not_recover"]) {
         database
           .query(
-            "INSERT INTO session_v2(id,project_id,slug,directory,version,time_created,time_updated,time_suspended,claim_pid,resume_attempts) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO session_v2(id,project_id,slug,directory,version,time_created,time_updated,time_suspended,claim_pid,resume_attempts,model) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
           )
-          .run(id, "global", id, root, "fixture", 1, 1, 123, dead.pid, 0)
+          .run(
+            id,
+            "global",
+            id,
+            root,
+            "fixture",
+            1,
+            1,
+            123,
+            dead.pid,
+            0,
+            JSON.stringify({ providerID: "fixture-unavailable", id: "never-call-a-provider" }),
+          )
       }
       database
         .query(
