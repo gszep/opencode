@@ -74,6 +74,7 @@ import { SkillInstructions } from "@opencode/core/skill/instructions"
 import { ReferenceInstructions } from "@opencode/core/reference/instructions"
 import { McpInstructions } from "@opencode/core/mcp/instructions"
 import { SessionSystemPrompt } from "@opencode/core/session/system-prompt"
+import { runtimeGuidance } from "@opencode/core/session/runtime-guidance"
 import { ID, Model } from "@opencode/core/model"
 import { Location } from "@opencode/core/location"
 import { Provider } from "@opencode/core/provider"
@@ -1590,7 +1591,12 @@ describe("SessionRunnerLLM", () => {
     yield* s.session.prompt({ sessionID: forked.id, text: "Forked", resume: false })
     yield* s.session.resume(forked.id)
 
-    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([defaultSystem, fakeIdentity, "Latest context"])
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
+      defaultSystem,
+      fakeIdentity,
+      runtimeGuidance,
+      "Latest context",
+    ])
     // Copied history keeps the frozen chronological update; no new update is emitted.
     expect(systemTexts(s.requests.at(-1)!)).toContain("Changed context")
     expect(systemTexts(s.requests.at(-1)!)).not.toContain("Latest context")
@@ -1653,7 +1659,12 @@ describe("SessionRunnerLLM", () => {
     yield* s.resume
 
     expect(s.requests).toHaveLength(1)
-    expect(s.requests[0]?.system.map((part) => part.text)).toEqual([defaultSystem, fakeIdentity, "Initial context"])
+    expect(s.requests[0]?.system.map((part) => part.text)).toEqual([
+      defaultSystem,
+      fakeIdentity,
+      runtimeGuidance,
+      "Initial context",
+    ])
     expect(messageRoles(s.requests[0])).toEqual(["user", "user"])
     // The projected row is authoritative: a missing row admits a fresh baseline
     // instead of rebuilding from durable events.
@@ -1689,8 +1700,8 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests[0].messages).toHaveLength(1)
     expect(s.requests[1].messages.slice(0, 1)).toEqual([...s.requests[0].messages])
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, fakeIdentity, "Initial context"],
-      [defaultSystem, fakeIdentity, "Initial context"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context"],
     ])
     expect(messageRoles(s.requests[1])).toEqual(["user", "system", "user"])
     expect(s.requests[1]?.messages.at(1)?.content).toEqual([Expected.text("Changed context")])
@@ -1730,6 +1741,7 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
       expect.stringContaining("# Delegation"),
       gptIdentity,
+      runtimeGuidance,
       "Initial context",
     ])
   })
@@ -1751,6 +1763,7 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
       expect.stringContaining("# Delegation"),
       gptIdentity,
+      runtimeGuidance,
       "Initial context",
     ])
   })
@@ -1771,6 +1784,7 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
       "Build agent instructions",
       fakeIdentity,
+      runtimeGuidance,
       "Initial context",
     ])
   })
@@ -1796,6 +1810,7 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
       "Reviewer instructions",
       fakeIdentity,
+      runtimeGuidance,
       "Initial context",
     ])
     expect((yield* s.messages)[0]).toMatchObject({ type: "assistant", agent: "reviewer" })
@@ -1823,6 +1838,7 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
       "Reviewer instructions",
       fakeIdentity,
+      runtimeGuidance,
       "Initial context",
     ])
     expect((yield* s.messages)[0]).toMatchObject({ type: "assistant", agent: "reviewer" })
@@ -1866,8 +1882,8 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Second")
 
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, fakeIdentity, "Initial context\n\nBuild skills"],
-      [defaultSystem, fakeIdentity, "Initial context\n\nBuild skills"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context\n\nBuild skills"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context\n\nBuild skills"],
     ])
     expect(systemTexts(s.requests[1])).toContainEqual(expect.stringContaining("Reviewer skills"))
   })
@@ -1889,7 +1905,7 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("First")
 
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, fakeIdentity, "Initial context\n\nBuild skills"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context\n\nBuild skills"],
     ])
   })
 
@@ -1908,7 +1924,7 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("First")
     expect(s.requests.map((request) => request.model)).toEqual([model])
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, fakeIdentity, "Initial context"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context"],
     ])
   })
 
@@ -1933,6 +1949,7 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests[0]?.system.map((part) => part.text)).toEqual([
       defaultSystem,
       fakeIdentity,
+      runtimeGuidance,
       ["Initial context", "", '<context key="deploy-target">', "production", "</context>"].join("\n"),
     ])
 
@@ -2020,9 +2037,9 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Third")
 
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, fakeIdentity, "Initial context"],
-      [defaultSystem, fakeIdentity, "Initial context"],
-      [defaultSystem, replacementIdentity, "Initial context"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context"],
+      [defaultSystem, replacementIdentity, runtimeGuidance, "Initial context"],
     ])
     expect(messageRoles(s.requests[1])).toEqual(["user", "system", "user"])
     expect(s.requests[2]?.messages.filter((message) => message.role === "system")).toHaveLength(2)
@@ -2084,9 +2101,9 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Third")
 
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, fakeIdentity, "Initial context"],
-      [defaultSystem, replacementIdentity, "Initial context"],
-      [defaultSystem, replacementIdentity, "Initial context"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context"],
+      [defaultSystem, replacementIdentity, runtimeGuidance, "Initial context"],
+      [defaultSystem, replacementIdentity, runtimeGuidance, "Initial context"],
     ])
   })
 
@@ -2102,9 +2119,9 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Second")
 
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, fakeIdentity, "Initial context"],
-      [defaultSystem, fakeIdentity, "Initial context"],
-      [defaultSystem, fakeIdentity, "Initial context"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context"],
     ])
     expect(messageRoles(s.requests[2])).toEqual(["user", "system", "user"])
     expect(s.requests[2]?.messages.at(1)?.content).toEqual([Expected.text("Replacement context")])
@@ -3071,6 +3088,7 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests[2]?.system.map((part) => part.text)).toEqual([
       defaultSystem,
       replacementIdentity,
+      runtimeGuidance,
       "Initial context",
     ])
     expect(systemTexts(s.requests[2])).toContain("Changed during compaction")
@@ -3263,7 +3281,12 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Third")
 
     // Compaction already moved current values into the new epoch before the unavailable read.
-    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([defaultSystem, fakeIdentity, "Changed context"])
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
+      defaultSystem,
+      fakeIdentity,
+      runtimeGuidance,
+      "Changed context",
+    ])
     expect(systemTexts(s.requests.at(-1)!)).not.toContain("Changed context")
   })
 
@@ -3400,8 +3423,8 @@ describe("SessionRunnerLLM", () => {
 
     expect(s.requests.map((request) => request.model)).toEqual([model, replacementModel])
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, fakeIdentity, "Initial context"],
-      [defaultSystem, replacementIdentity, "Initial context"],
+      [defaultSystem, fakeIdentity, runtimeGuidance, "Initial context"],
+      [defaultSystem, replacementIdentity, runtimeGuidance, "Initial context"],
     ])
     expect(systemTexts(s.requests[1])).toContain("Replacement context")
   })
@@ -4425,6 +4448,25 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests[0]?.http?.headers?.["x-parent-session-id"]).toBe(parentID)
     expect(s.requests[0]?.promptCacheKey).toBe(parentID)
   })
+
+  scenario(
+    "supplies runtime guidance to new and resumed native children without parent instruction entries",
+    function* (s) {
+      const entries = yield* InstructionEntry.Service
+      yield* entries.put({ sessionID, key: "parent-only", value: "Parent private context" })
+      yield* s.runPrompt("Parent request")
+      const child = yield* s.session.create({ parentID: sessionID })
+      for (const text of ["New child", "Resumed child"]) {
+        yield* s.session.prompt({ sessionID: child.id, text, resume: false })
+        yield* s.session.resume(child.id)
+        const request = s.requests.at(-1)!
+        expect(request.system.filter((part) => part.text === runtimeGuidance)).toHaveLength(1)
+        expect(JSON.stringify(request.messages)).not.toContain(runtimeGuidance)
+        expect(request.system.map((part) => part.text).join("\n")).not.toContain("Parent private context")
+      }
+      expect(JSON.stringify(yield* s.session.messages({ sessionID: child.id }))).not.toContain(runtimeGuidance)
+    },
+  )
 
   scenario("runs different sessions concurrently", function* (s) {
     yield* insertSession(otherSessionID)

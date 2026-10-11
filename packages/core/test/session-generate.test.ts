@@ -32,6 +32,7 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { SessionEvent } from "@opencode/core/session/event"
 import { SessionContext } from "@opencode/core/session/context"
 import { SessionGenerate } from "@opencode/core/session/generate"
+import { runtimeGuidance } from "@opencode/core/session/runtime-guidance"
 import { InstructionState } from "@opencode/core/session/instruction-state"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionProjector } from "@opencode/core/session/projector"
@@ -331,6 +332,8 @@ it.effect(
       expect(requests).toHaveLength(1)
       expect(requests[0]?.model).toBe(model)
       expect(requests[0]?.system.map((part) => part.text)).toContain("Initial context")
+      expect(requests[0]?.system.filter((part) => part.text === runtimeGuidance)).toHaveLength(1)
+      expect(JSON.stringify(requests[0]?.messages)).not.toContain(runtimeGuidance)
       expect(requests[0]?.http?.headers).toMatchObject({ "X-Session-Id": sessionID })
       expect(requests[0]?.promptCacheKey).toBe(sessionID)
       const instructionUpdates = requests[0]?.messages.flatMap((message) =>

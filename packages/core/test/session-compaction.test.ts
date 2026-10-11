@@ -11,6 +11,8 @@ import { SessionCompaction } from "@opencode/core/session/compaction"
 import { SessionEvent } from "@opencode/core/session/event"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionModelRequest } from "@opencode/core/session/model-request"
+import { runtimeGuidance } from "@opencode/core/session/runtime-guidance"
+import { Token } from "@opencode/core/util/token"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
@@ -237,14 +239,16 @@ it.effect("auto compaction estimates current content against the buffered prompt
 
     const interrupted = { ...assistant, id: SessionMessage.ID.create(), tokens: undefined }
     expect(SessionCompaction.estimateTokens({ ...grown, messages: [...grown.messages, interrupted] })).toBe(80_001)
-    // Without provider usage, include 20 tokens for the system prompt, instructions, and tool definition.
-    expect(SessionCompaction.estimateTokens({ ...grown, messages: [interrupted] })).toBe(21)
+    // Without provider usage, count runtime guidance as well as the baseline and tool definition.
+    expect(SessionCompaction.estimateTokens({ ...grown, messages: [interrupted] })).toBe(
+      21 + Token.estimate(runtimeGuidance),
+    )
     expect(
       SessionCompaction.estimateTokens({
         ...grown,
         messages: [{ ...interrupted, tokens: input(0, contextLimited).messages[0].tokens }],
       }),
-    ).toBe(21)
+    ).toBe(21 + Token.estimate(runtimeGuidance))
 
     const media = [
       { type: "file", mime: "image/png", uri: `data:image/png;base64,${"a".repeat(100_000)}` },
@@ -272,7 +276,9 @@ it.effect("auto compaction estimates current content against the buffered prompt
         resolved: { ...grown.resolved, capabilities: { ...grown.resolved.capabilities, input: modalities } },
       }
       expect(SessionCompaction.estimateTokens({ ...selected, messages: [...messages, user] })).toBe(tokens)
-      expect(SessionCompaction.estimateTokens({ ...selected, messages: [user] })).toBe(fallback + 20)
+      expect(SessionCompaction.estimateTokens({ ...selected, messages: [user] })).toBe(
+        fallback + 20 + Token.estimate(runtimeGuidance),
+      )
     }
 
     const checkpoint = Schema.decodeUnknownSync(SessionMessage.CompactionCompleted)({
@@ -397,6 +403,8 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
     ])
 
     expect(requests).toHaveLength(1)
+    expect(requests[0]?.system.filter((part) => part.text === runtimeGuidance)).toHaveLength(1)
+    expect(JSON.stringify(requests[0]?.messages)).not.toContain(runtimeGuidance)
     expect(requests[0]?.promptCacheKey).toBe(parentID)
     expect(requests[0]?.http?.headers).toEqual({
       "x-session-affinity": sessionID,

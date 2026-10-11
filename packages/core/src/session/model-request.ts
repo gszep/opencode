@@ -36,6 +36,7 @@ import { SessionProviderContext } from "./provider-context.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionSystemPrompt } from "./system-prompt.js"
+import { runtimeGuidance } from "./runtime-guidance.js"
 import { toLLMMessages } from "./runner/to-llm-message.js"
 import type { SessionMessage } from "./message.js"
 
@@ -85,6 +86,8 @@ export const baseTranscript = (input: {
       input.agent.system
         ? input.agent.system
         : SessionSystemPrompt.make(input.tools.definitions.map((tool) => tool.name)),
+      // Keep shared guidance outside the first part replaced by model prompt plugins.
+      runtimeGuidance,
       input.initial,
     ]
       .filter((part) => part.length > 0)
