@@ -1,6 +1,7 @@
 export * as SessionExecution from "./execution.js"
 
 import { Cause, Context, Effect, Exit, Layer } from "effect"
+import { eq } from "drizzle-orm"
 import { Bus } from "../bus.js"
 import { Database } from "../database/database.js"
 import { Job } from "../job.js"
@@ -14,6 +15,20 @@ import { SessionStore } from "./store.js"
 import { toSessionError } from "./to-session-error.js"
 import { UserInterruptedError } from "./error.js"
 import { SessionInbox } from "./inbox.js"
+import { SessionTable } from "./sql.js"
+
+class OrphanClaimChanged extends Error {}
+
+function ownerIsGone(pid: number) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (error) {
+    // PID reuse, EPERM and unavailable process probes never prove a dead owner.
+    return error instanceof Error && "code" in error && error.code === "ESRCH"
+  }
+}
 
 export interface Interface {
   /** Snapshots active execution owned by this process. */
@@ -25,9 +40,10 @@ export interface Interface {
   /** Registers newly recorded work. Repeated wakeups may coalesce. */
   readonly wake: (sessionID: SessionSchema.ID) => Effect.Effect<void>
   /**
-   * Interrupt active work owned by this process. Idle interruption is a no-op. Resolves once
+   * Interrupt active work owned by this process, or cancel an original root claim whose
+   * owner is gone before recovery begins. True idle and live foreign owners remain no-ops. Resolves once
    * the interruption is accepted; cleanup settles asynchronously in the execution fiber.
-   * Returns whether an active execution was interrupted. Compose with `awaitIdle` when
+   * Returns whether local execution or an original orphaned intent was interrupted. Compose with `awaitIdle` when
    * settlement matters. `awaitSettlement` waits only for the interrupted execution,
    * rather than fresh work admitted during its cleanup.
    */
@@ -156,7 +172,64 @@ export const layer = Layer.effect(
       interrupt: (sessionID, options) =>
         Effect.gen(function* () {
           const interrupted = yield* coordinator.interrupt(sessionID, options?.reason ?? "user", options)
-          if (!options?.resume) return interrupted
+          if (!options?.resume) {
+            if (interrupted || (yield* coordinator.isActive(sessionID))) return interrupted
+            if (options?.reason === "inactivity") return false
+            const read = () =>
+              db
+                .select({
+                  pid: SessionTable.claim_pid,
+                  at: SessionTable.time_suspended,
+                  attempts: SessionTable.resume_attempts,
+                  parent: SessionTable.parent_id,
+                })
+                .from(SessionTable)
+                .where(eq(SessionTable.id, sessionID))
+                .get()
+                .pipe(Effect.orDie)
+            const claim = yield* read()
+            // A child has a separate background-job owner. A recovery attempt may
+            // already be preparing work before its coordinator starts; do not take it over.
+            if (
+              !claim ||
+              claim.parent !== null ||
+              claim.pid === null ||
+              claim.at === null ||
+              claim.attempts !== 0 ||
+              !ownerIsGone(claim.pid)
+            )
+              return false
+            const pid = claim.pid
+            return yield* bus
+              .publish(
+                SessionEvent.Execution.Interrupted,
+                { sessionID, reason: "user" },
+                {
+                  commit: () =>
+                    Effect.gen(function* () {
+                      const current = yield* read()
+                      if (
+                        !current ||
+                        current.parent !== null ||
+                        current.pid !== pid ||
+                        current.at !== claim.at ||
+                        current.attempts !== 0 ||
+                        !ownerIsGone(pid)
+                      )
+                        return yield* Effect.die(new OrphanClaimChanged())
+                      yield* store.release(sessionID)
+                    }),
+                },
+              )
+              .pipe(
+                Effect.as(true),
+                // Projectors and this commit share one transaction, so a changed
+                // claim rolls back the terminal and history projection as well.
+                Effect.catchDefect((error) =>
+                  error instanceof OrphanClaimChanged ? Effect.succeed(false) : Effect.die(error),
+                ),
+              )
+          }
           // Resume steering input and between-turn control work from the interrupted
           // intent. Queued next-turn prompts stay parked: a steer-scoped drain never
           // promotes them, and a control item behind a queued prompt waits its turn.

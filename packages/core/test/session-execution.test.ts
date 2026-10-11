@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test, spyOn } from "bun:test"
 import { AIError, TransportError } from "@opencode/ai"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -20,7 +20,7 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionRunner } from "@opencode/core/session/runner/index"
-import { SessionInboxTable, SessionTable } from "@opencode/core/session/sql"
+import { SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Scope } from "effect"
 import { eq } from "drizzle-orm"
@@ -157,6 +157,192 @@ describe("SessionExecution lifecycle", () => {
       expect(yield* execution.interrupt(sessionID)).toBeFalse()
       expect(yield* execution.active).not.toContain(sessionID)
       expect(yield* execution.isActive(sessionID)).toBe(false)
+    }),
+  )
+
+  it.effect("stops a dead owner's original root intent without draining or advancing its inbox", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const store = yield* SessionStore.Service
+      const sessionID = Session.ID.make("ses_original_orphan_stop")
+      const dead = yield* exitedProcess
+      yield* seedSessions(database, [sessionID], { claim_pid: dead, time_suspended: 123 })
+      const priorID = SessionMessage.ID.make("msg_before_orphan_stop")
+      yield* database.db
+        .insert(SessionMessageTable)
+        .values({
+          id: priorID,
+          session_id: sessionID,
+          type: "user",
+          seq: 0,
+          time_created: 1,
+          time_updated: 1,
+          data: { time: { created: 1 }, text: "Existing history must remain unchanged" },
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* Bus.reserveSequence(database.db, sessionID, 0)
+      const history = yield* database.db.select().from(SessionMessageTable).all().pipe(Effect.orDie)
+      yield* seedInbox(database, sessionID, ["steer", "queue"])
+      const before = yield* database.db.select().from(SessionInboxTable).all().pipe(Effect.orDie)
+      const drained: Session.ID[] = []
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const context = yield* buildExecution(scope, ({ sessionID }) =>
+        Effect.sync(() => {
+          drained.push(sessionID)
+        }),
+      )
+      const execution = Context.get(context, SessionExecution.Service)
+      expect(yield* execution.interrupt(sessionID, { reason: "inactivity" })).toBe(false)
+      expect((yield* claims(database))[sessionID]).toBe(true)
+      expect(yield* execution.interrupt(sessionID)).toBe(true)
+      expect(yield* execution.interrupt(sessionID)).toBe(false)
+      expect((yield* claims(database))[sessionID]).toBe(false)
+      expect(yield* store.countResume(sessionID)).toBeUndefined()
+      yield* Context.get(context, SessionRestart.Service).resumeSuspendedSessions
+      expect(drained).toEqual([])
+      expect(yield* database.db.select().from(SessionInboxTable).all().pipe(Effect.orDie)).toEqual(before)
+      const messages = yield* database.db
+        .select()
+        .from(SessionMessageTable)
+        .where(eq(SessionMessageTable.session_id, sessionID))
+        .all()
+        .pipe(Effect.orDie)
+      expect(messages.filter((message) => message.id === priorID)).toEqual(history)
+      expect(
+        messages
+          .filter((message) => message.id !== priorID)
+          .map((message) => ({ type: message.type, data: message.data })),
+      ).toEqual([{ type: "idle", data: expect.objectContaining({ outcome: "interrupted" }) }])
+    }),
+  )
+
+  it.effect(
+    "does not take over live owners, unowned children, or an original claim already selected for recovery",
+    () =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const live = yield* liveProcess
+        const dead = yield* exitedProcess
+        const ids = [
+          "ses_stop_foreign_live",
+          "ses_stop_recovering",
+          "ses_stop_foreign_child",
+          "ses_stop_self_claim",
+        ].map((id) => Session.ID.make(id))
+        yield* seedSessions(database, [ids[0]], { claim_pid: live, time_suspended: 1 })
+        yield* seedSessions(database, [ids[1]], { claim_pid: dead, time_suspended: 1, resume_attempts: 1 })
+        yield* seedSessions(database, [ids[2]], { claim_pid: dead, time_suspended: 1, parent_id: ids[0] })
+        yield* seedSessions(database, [ids[3]], { claim_pid: process.pid, time_suspended: 1 })
+        const before = yield* database.db.select().from(SessionTable).all().pipe(Effect.orDie)
+        const scope = yield* Scope.make()
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+        const context = yield* buildExecution(scope, () => Effect.die("must not run"))
+        const execution = Context.get(context, SessionExecution.Service)
+        for (const id of ids) expect(yield* execution.interrupt(id)).toBe(false)
+        expect(yield* database.db.select().from(SessionTable).all().pipe(Effect.orDie)).toEqual(before)
+        expect(yield* database.db.select().from(SessionMessageTable).all().pipe(Effect.orDie)).toEqual([])
+      }),
+  )
+
+  it.effect("rolls back the terminal projection when the original orphan claim changes before commit", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const bus = yield* Bus.Service
+      const store = yield* SessionStore.Service
+      const sessionID = Session.ID.make("ses_orphan_stop_race")
+      yield* seedSessions(database, [sessionID], { claim_pid: yield* exitedProcess, time_suspended: 123 })
+      const before = yield* database.db.select().from(SessionTable).all().pipe(Effect.orDie)
+      // Exercise the real event transaction. An unexpected claim change inside
+      // another projector must roll back both the idle row and the release.
+      yield* bus.project(SessionEvent.Execution.Interrupted, () => store.claim(sessionID))
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const context = yield* buildExecution(scope, () => Effect.die("must not run"))
+      expect(yield* Context.get(context, SessionExecution.Service).interrupt(sessionID)).toBe(false)
+      expect(yield* database.db.select().from(SessionTable).all().pipe(Effect.orDie)).toEqual(before)
+      expect(yield* database.db.select().from(SessionMessageTable).all().pipe(Effect.orDie)).toEqual([])
+    }),
+  )
+
+  it.effect("fails closed on indeterminate owners and a PID becoming live before the cancellation commits", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const sessionID = Session.ID.make("ses_orphan_stop_owner_probe")
+      const pid = yield* exitedProcess
+      yield* seedSessions(database, [sessionID], { claim_pid: pid, time_suspended: 123 })
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const context = yield* buildExecution(scope, () => Effect.die("must not run"))
+      const execution = Context.get(context, SessionExecution.Service)
+      for (const code of ["EPERM", "EIO"]) {
+        const probe = spyOn(process, "kill").mockImplementation(() => {
+          throw Object.assign(new Error("probe unavailable"), { code })
+        })
+        try {
+          expect(yield* execution.interrupt(sessionID)).toBe(false)
+        } finally {
+          probe.mockRestore()
+        }
+      }
+      const probe = spyOn(process, "kill")
+        .mockImplementationOnce(() => {
+          throw Object.assign(new Error("absent"), { code: "ESRCH" })
+        })
+        .mockImplementation(() => true)
+      try {
+        expect(yield* execution.interrupt(sessionID)).toBe(false)
+      } finally {
+        probe.mockRestore()
+      }
+      expect((yield* claims(database))[sessionID]).toBe(true)
+      expect(yield* database.db.select().from(SessionMessageTable).all().pipe(Effect.orDie)).toEqual([])
+    }),
+  )
+
+  it.effect("recovery cleans a stopped orphan's dead shell marker without resuming or redelivering input", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const kv = yield* KV.Service
+      const jobs = yield* Job.Service
+      const sessionID = Session.ID.make("ses_stopped_orphan_shell")
+      const notificationID = SessionMessage.ID.make("msg_stopped_orphan_shell")
+      const dead = yield* exitedProcess
+      yield* seedSessions(database, [sessionID], { claim_pid: dead, time_suspended: 123 })
+      yield* seedInbox(database, sessionID, ["queue"])
+      yield* Bus.reserveSequence(database.db, sessionID, 1)
+      const before = yield* database.db.select().from(SessionInboxTable).all().pipe(Effect.orDie)
+      yield* kv.set(`job.background/${notificationID}`, {
+        id: "sh_stopped_orphan",
+        notificationID,
+        status: "running",
+        pid: dead,
+        recovery: { kind: "shell", sessionID, shellID: "sh_stopped_orphan", command: "fixture-only" },
+      })
+      const drained: Session.ID[] = []
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const context = yield* buildExecution(scope, ({ sessionID }) =>
+        Effect.sync(() => {
+          drained.push(sessionID)
+        }),
+      )
+      expect(yield* Context.get(context, SessionExecution.Service).interrupt(sessionID)).toBe(true)
+      const restart = Context.get(context, SessionRestart.Service)
+      yield* restart.resumeSuspendedSessions
+      expect(drained).toEqual([])
+      expect(yield* jobs.pendingBackground).toEqual([])
+      const after = yield* database.db.select().from(SessionInboxTable).all().pipe(Effect.orDie)
+      expect(after.filter((row) => row.id !== notificationID)).toEqual(before)
+      expect(after.find((row) => row.id === notificationID)).toMatchObject({
+        type: "synthetic",
+        delivery: "steer",
+        payload: { metadata: { source: "shell", state: "cancelled" } },
+      })
+      yield* restart.resumeSuspendedSessions
+      expect(yield* database.db.select().from(SessionInboxTable).all().pipe(Effect.orDie)).toEqual(after)
+      expect(drained).toEqual([])
     }),
   )
 

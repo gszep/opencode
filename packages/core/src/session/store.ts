@@ -271,7 +271,14 @@ const layer = Layer.effect(
             resume_attempts: sql`${SessionTable.resume_attempts} + 1`,
             time_updated: sql`${SessionTable.time_updated}`,
           })
-          .where(eq(SessionTable.id, sessionID))
+          // A root selected by an earlier recovery sweep may have been stopped
+          // meanwhile. Children also recover from their owning background job.
+          .where(
+            and(
+              eq(SessionTable.id, sessionID),
+              or(isNotNull(SessionTable.time_suspended), isNotNull(SessionTable.parent_id)),
+            ),
+          )
           .returning({ attempts: SessionTable.resume_attempts })
           .get()
           .pipe(Effect.orDie)
