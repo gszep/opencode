@@ -3,6 +3,7 @@
 - Current implementation changes belong in `packages/core`, `packages/cli`, `packages/server`, `packages/protocol`, `packages/schema`, and related generated client surfaces when required.
 - This repository does not use Changesets. Do not add `.changeset` files; follow the existing release workflow instead.
 - The default branch in this repo is `v2`.
+- Shared runtime workflow guidance belongs in `packages/core/src/session/runtime-guidance.ts`, not model-specific prompt templates or persisted Session instruction entries. Keep repository rules here; installed copies of shared guidance must identify their versioned source.
 - Default new branches and worktrees to `v2`, or `origin/v2` when the local `v2` ref is unavailable, and default pull requests to target `v2`. Use another base or target branch when the requester explicitly instructs it.
 - Local `main` ref may not exist; use `v2` or `origin/v2` for diffs.
 

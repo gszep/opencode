@@ -7,6 +7,7 @@ import { PluginHost } from "@opencode/core/plugin/host"
 import { OptimizePlugin } from "@opencode/core/plugin/optimize"
 import { Session } from "@opencode/core/session"
 import { SessionSystemPrompt } from "@opencode/core/session/system-prompt"
+import { runtimeGuidance } from "@opencode/core/session/runtime-guidance"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
 import { Model } from "@opencode/schema/model"
 import { Provider } from "@opencode/core/provider"
@@ -46,6 +47,23 @@ const context = (id: string, system = fallback): SessionHooks["context"] => ({
 })
 
 describe("OptimizePlugin", () => {
+  it.effect("preserves shared runtime guidance across request hooks and model changes", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      const pluginHost = yield* makeHost
+      yield* Effect.forEach(OptimizePlugin.Plugins, (plugin) => plugin.effect(pluginHost), { discard: true })
+      for (const hook of ["context", "compaction", "generate"] as const) {
+        for (const id of ["gpt-6-astra", "gpt-5", "claude-sonnet-4", "kimi-k2", "trinity", "muse", "other"]) {
+          const event = context(id)
+          event.system.push(SystemPart.make(runtimeGuidance), SystemPart.make("Project instructions"))
+          yield* hooks.trigger("session", hook, event)
+          expect(event.system.slice(1).map((part) => part.text)).toEqual([runtimeGuidance, "Project instructions"])
+          expect(event.system.filter((part) => part.text === runtimeGuidance)).toHaveLength(1)
+        }
+      }
+    }),
+  )
+
   test("enables prompt plugins without model-specific tool optimization", () => {
     expect(OptimizePlugin.Plugins.map((plugin) => plugin.id)).toEqual([
       "opencode.prompt.openai",
@@ -271,10 +289,11 @@ describe("OptimizePlugin", () => {
         discard: true,
       })
       const event = context("gpt-5", "Custom agent prompt")
+      event.system.push(SystemPart.make(runtimeGuidance))
 
       yield* hooks.trigger("session", "context", event)
 
-      expect(event.system.map((part) => part.text)).toEqual(["Custom agent prompt"])
+      expect(event.system.map((part) => part.text)).toEqual(["Custom agent prompt", runtimeGuidance])
       expect(Object.keys(event.tools).sort()).toEqual(["edit", "glob", "grep", "patch", "read", "shell", "write"])
     }),
   )
