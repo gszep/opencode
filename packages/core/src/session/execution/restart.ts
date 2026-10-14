@@ -11,6 +11,8 @@ import { SessionSchema } from "../schema.js"
 import { SessionStore } from "../store.js"
 import { ShellResult } from "../../shell/result.js"
 import { SubagentCompletion } from "../subagent-completion.js"
+import { Database } from "../../database/database.js"
+import { SessionDrain } from "../drain.js"
 
 const CONTINUE_AFTER_SERVER_RESTART =
   "The server restarted while you were working. Continue from where you left off without repeating completed work."
@@ -67,6 +69,7 @@ export const layer = (options?: Options) =>
     Service,
     Effect.gen(function* () {
       const store = yield* SessionStore.Service
+      const db = (yield* Database.Service).db
       const execution = yield* SessionExecution.Service
       const bus = yield* Bus.Service
       const jobs = yield* Job.Service
@@ -75,6 +78,7 @@ export const layer = (options?: Options) =>
       const maxAttempts = options?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
 
       const prepareResume = Effect.fnUntraced(function* (sessionID: SessionSchema.ID) {
+        if (yield* SessionDrain.isHeld(db, sessionID)) return false
         // Durable before the resume runs, so a crash inside the resumed turn is
         // counted by the next sweep and the budget cannot be dodged.
         const attempts = yield* store.countResume(sessionID)
@@ -222,6 +226,11 @@ export const layer = (options?: Options) =>
             // Admit shell outcomes before a recovered child can start its first model request.
             pending.toSorted((a, b) => Number(a.recovery.kind === "subagent") - Number(b.recovery.kind === "subagent")),
             Effect.fnUntraced(function* (background) {
+              const owner =
+                background.recovery.kind === "shell"
+                  ? background.recovery.sessionID
+                  : background.recovery.parentSessionID
+              if (yield* SessionDrain.isHeld(db, owner)) return
               if ((yield* jobs.get(background.id))?.status === "running") return
               const recovery = background.recovery
               yield* recovery.kind === "shell"
@@ -269,5 +278,5 @@ function heldByOtherLiveProcess(pid: number) {
 export const node = makeGlobalNode({
   service: Service,
   layer: layer(),
-  deps: [SessionStore.node, SessionExecution.node, Bus.node, Job.node, Session.node],
+  deps: [SessionStore.node, SessionExecution.node, Bus.node, Job.node, Session.node, Database.node],
 })

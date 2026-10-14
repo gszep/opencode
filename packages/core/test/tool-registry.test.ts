@@ -8,6 +8,12 @@ import { Session } from "@opencode/core/session"
 import { SessionMessage } from "@opencode/core/session/message"
 import { State } from "@opencode/core/state"
 import { Tool } from "@opencode/core/tool"
+import { Database } from "@opencode/core/database/database"
+import { SessionDrain } from "@opencode/core/session/drain"
+import { SessionTable } from "@opencode/core/session/sql"
+import { ProjectTable } from "@opencode/core/project/sql"
+import { Project } from "@opencode/schema/project"
+import { AbsolutePath } from "@opencode/schema/schema"
 import type { Info } from "@opencode/schema/tool"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { codeModeListings, executeTool, toolDefinitions } from "./lib/tool"
@@ -37,7 +43,7 @@ const imageStore = Layer.mock(Image.Service, {
     })
   },
 })
-const registryLayer = AppNodeBuilder.build(LayerNode.group([Tool.node, PluginHooks.node]), [
+const registryLayer = AppNodeBuilder.build(LayerNode.group([Tool.node, PluginHooks.node, Database.node]), [
   Image.node.replace(imageStore),
 ])
 const it = testEffect(registryLayer)
@@ -46,6 +52,64 @@ const identity = {
   messageID: SessionMessage.ID.make("msg_registry"),
 }
 const sessionID = Session.ID.make("ses_registry")
+
+it.effect("drain v1 tracks real tool dispatch through completion and fences retained snapshots", () =>
+  Effect.gen(function* () {
+    const database = yield* Database.Service
+    yield* database.db
+      .insert(ProjectTable)
+      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .run()
+      .pipe(Effect.orDie)
+    yield* database.db
+      .insert(SessionTable)
+      .values({
+        id: sessionID,
+        project_id: Project.ID.global,
+        directory: "/project",
+        slug: "tool-fence",
+        version: "test",
+      })
+      .run()
+      .pipe(Effect.orDie)
+    const registry = yield* Tool.Service
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let calls = 0
+    yield* registry.transform((editor) =>
+      editor.add({
+        name: "fenced",
+        description: "controlled native tool",
+        options: { codemode: false },
+        input: Schema.Struct({ text: Schema.String }),
+        execute: () =>
+          Effect.gen(function* () {
+            calls++
+            yield* Deferred.succeed(entered, undefined)
+            yield* Deferred.await(release)
+            return { content: "done" }
+          }),
+      }),
+    )
+    const snapshot = yield* registry.snapshot()
+    const running = yield* snapshot.execute(call("fenced")).pipe(Effect.forkScoped)
+    yield* Deferred.await(entered)
+    const request = {
+      v: 1 as const,
+      sessionID,
+      requestID: "00000000-0000-4000-8000-000000000020",
+      generation: 0,
+      sequence: -1,
+    }
+    yield* SessionDrain.begin(request)
+    expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+    yield* Deferred.succeed(release, undefined)
+    expect((yield* Fiber.join(running)).content).toEqual([{ type: "text", text: "done" }])
+    expect((yield* SessionDrain.complete(request)).phase).toBe("quiescent")
+    expect(yield* snapshot.execute(call("fenced")).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+    expect(calls).toBe(1)
+  }),
+)
 const call = (name: string, id = `call-${name}`): Parameters<Tool.Snapshot["execute"]>[0] => ({
   sessionID,
   ...identity,

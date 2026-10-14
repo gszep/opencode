@@ -24,6 +24,7 @@ import { Project } from "@opencode/schema/project"
 import { AbsolutePath, RelativePath } from "../schema.js"
 import type { SessionSchema } from "./schema.js"
 import { ProjectTable } from "../project/sql.js"
+import { SessionDrain } from "./drain.js"
 
 type DatabaseService = Database.Interface["db"]
 type MessageEvent = Exclude<
@@ -437,6 +438,8 @@ const layer = Layer.effectDiscard(
     const db = (yield* Database.Service).db
     yield* bus.project(SessionEvent.Created, (event) =>
       Effect.gen(function* () {
+        yield* SessionDrain.assertOpen(db, event.data.sessionID)
+        if (event.data.parentID) yield* SessionDrain.assertOpen(db, event.data.parentID)
         const stored = yield* db
           .insert(SessionTable)
           .values({
@@ -640,6 +643,7 @@ const layer = Layer.effectDiscard(
     )
     yield* bus.project(SessionEvent.InboxEnqueued, (event) =>
       Effect.gen(function* () {
+        yield* SessionDrain.assertOpen(db, event.data.sessionID)
         yield* SessionInbox.projectAdmitted(db, {
           enqueuedSeq: event.durable.seq,
           id: event.data.inboxID,
@@ -677,7 +681,9 @@ const layer = Layer.effectDiscard(
         yield* InstructionState.apply(db, event.data.sessionID, event.durable.seq, event.data.delta)
       }),
     )
-    yield* bus.project(SessionEvent.Synthetic, (event) => run(db, event))
+    yield* bus.project(SessionEvent.Synthetic, (event) =>
+      SessionDrain.assertOpen(db, event.data.sessionID).pipe(Effect.andThen(run(db, event))),
+    )
     yield* bus.project(SessionEvent.Skill.Activated, (event) => run(db, event))
     yield* bus.project(SessionEvent.Shell.Started, (event) => run(db, event))
     yield* bus.project(SessionEvent.Shell.Ended, (event) => run(db, event))

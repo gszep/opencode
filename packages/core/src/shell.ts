@@ -1,7 +1,7 @@
 export * as Shell from "./shell.js"
 
 import path from "path"
-import { Context, Deferred, Duration, Effect, Fiber, Latch, Layer, Schema, Schedule, Stream } from "effect"
+import { Context, Deferred, Duration, Effect, Exit, Fiber, Latch, Layer, Schema, Schedule, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { produce } from "immer"
 import { Shell } from "@opencode/schema/shell"
@@ -21,6 +21,8 @@ import { SessionSchema } from "./session/schema.js"
 import { Config } from "./config.js"
 import { ToolOutput } from "./tool-output.js"
 import { ShellResult } from "./shell/result.js"
+import { Database } from "./database/database.js"
+import { SessionDrain } from "./session/drain.js"
 
 export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Shell.NotFoundError", {
   id: Shell.ID,
@@ -126,6 +128,7 @@ const layer = () =>
       const hooks = yield* PluginHooks.Service
       const environments = yield* SessionEnvironment.Service
       const config = yield* Config.Service
+      const db = (yield* Database.Service).db
       const context = yield* Effect.context()
       const runFork = Effect.runForkWith(context)
       const commands = new Map<Shell.ID, Active>()
@@ -239,9 +242,7 @@ const layer = () =>
           if (page.output.endsWith("\n")) lines.pop()
           const truncated = latest.size > maxBytes || lines.length > maxLines
           const text = lines.length > maxLines ? lines.slice(-maxLines).join("\n") : page.output
-          const notice = truncated
-            ? `${text ? "\n\n" : ""}[full output saved to ${info.file}]`
-            : ""
+          const notice = truncated ? `${text ? "\n\n" : ""}[full output saved to ${info.file}]` : ""
           return { output: `${text}${notice}`, truncated }
         }).pipe(Effect.catchTag("Shell.NotFoundError", () => Effect.succeed(undefined)))
         return { info, capture }
@@ -411,7 +412,12 @@ const layer = () =>
               // release (kill) the process before its exit is observed.
               yield* Deferred.await(command.done).pipe(Effect.catch(() => Effect.void))
             }),
-          ).pipe(Effect.catchTag("AppProcessError", (error) => Deferred.fail(ready, error))),
+          ).pipe(
+            // Release only after the child-process scope and its finalizers close.
+            (running) =>
+              Schema.is(SessionSchema.ID)(sessionID) ? SessionDrain.work(db, sessionID, "shell", running) : running,
+            Effect.onExit((exit) => (Exit.isFailure(exit) ? Deferred.failCause(ready, exit.cause) : Effect.void)),
+          ),
         )
 
         const command = yield* Deferred.await(ready)
@@ -434,6 +440,7 @@ export const node = makeLocationNode({
     PluginHooks.node,
     SessionEnvironment.node,
     Config.node,
+    Database.node,
     cleanupNode,
   ],
 })

@@ -13,6 +13,7 @@ import { SessionMessage } from "./message.js"
 import { Session } from "@opencode/schema/session"
 import { SessionMessageTable, SessionTable } from "./sql.js"
 import { fromRow } from "./info.js"
+import { SessionDrain } from "./drain.js"
 
 const ListInputBase = {
   workspaceID: Workspace.ID.pipe(Schema.optional),
@@ -217,6 +218,7 @@ const layer = Layer.effect(
           )
       }),
       claim: Effect.fn("SessionStore.claim")(function* (sessionID) {
+        yield* SessionDrain.assertOpen(db, sessionID)
         // Re-claiming keeps the original claim time (a resumed turn re-claims
         // through the same started hook) but moves the claim to this process.
         // Claim bookkeeping never counts as user activity: time_updated is

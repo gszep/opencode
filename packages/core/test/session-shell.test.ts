@@ -12,6 +12,10 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionExecution } from "@opencode/core/session/execution"
 import { SessionRunCoordinator } from "@opencode/core/session/run-coordinator"
 import { Shell } from "@opencode/core/shell"
+import { Database } from "@opencode/core/database/database"
+import { EventSequenceTable } from "@opencode/core/event/sql"
+import { SessionDrain } from "@opencode/core/session/drain"
+import { eq } from "drizzle-orm"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { location } from "./fixture/location"
 import { offlineModels } from "./fixture/models"
@@ -57,11 +61,14 @@ const executionLayer = Layer.effect(
 )
 
 const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([Bus.node, Session.node, SessionExecution.node, LocationServiceMap.node]), [
-    Bus.node.replace(Bus.configured({ persist: true })),
-    SessionExecution.node.replace(executionLayer.pipe(Layer.provide(controlLayer))),
-    offlineModels,
-  ]).pipe(Layer.provideMerge(controlLayer)),
+  AppNodeBuilder.build(
+    LayerNode.group([Bus.node, Session.node, SessionExecution.node, LocationServiceMap.node, Database.node]),
+    [
+      Bus.node.replace(Bus.configured({ persist: true })),
+      SessionExecution.node.replace(executionLayer.pipe(Layer.provide(controlLayer))),
+      offlineModels,
+    ],
+  ).pipe(Layer.provideMerge(controlLayer)),
 )
 
 const setup = Effect.gen(function* () {
@@ -106,6 +113,62 @@ const launch = Effect.fn(function* (fixture: Effect.Success<typeof setup>, name:
 })
 
 describe("Session.shell", () => {
+  it.live("drain v1 observes a real owned shell exit rather than an idle agent or remove acknowledgement", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup
+      const database = yield* Database.Service
+      const releasePath = path.join(fixture.tmp.path, "drain.release")
+      const startedPath = path.join(fixture.tmp.path, "drain.started")
+      const release = Effect.promise(() => Bun.write(releasePath, ""))
+      yield* Effect.addFinalizer(() => release)
+      const command =
+        process.platform === "win32"
+          ? "New-Item drain.started -ItemType File | Out-Null; while (!(Test-Path drain.release)) { Start-Sleep -Milliseconds 10 }"
+          : "touch drain.started; while [ ! -f drain.release ]; do sleep 0.01; done"
+      const child = yield* fixture.shell.create({
+        command,
+        cwd: fixture.tmp.path,
+        metadata: { sessionID: fixture.created.id },
+        timeout: 0,
+      })
+      yield* Effect.promise(() => Bun.file(startedPath).exists()).pipe(
+        Effect.repeat({ until: (exists) => exists, schedule: Schedule.spaced("10 millis") }),
+        Effect.timeout("5 seconds"),
+      )
+      const head = yield* database.db
+        .select({ seq: EventSequenceTable.seq })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, fixture.created.id))
+        .get()
+        .pipe(Effect.orDie)
+      if (!head) return yield* Effect.die("missing native sequence")
+      const request = {
+        v: 1 as const,
+        sessionID: fixture.created.id,
+        requestID: "00000000-0000-4000-8000-000000000030",
+        generation: 0,
+        sequence: head.seq,
+      }
+      yield* SessionDrain.begin(request)
+      expect(yield* fixture.execution.isActive(fixture.created.id)).toBe(false)
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      expect(
+        yield* fixture.shell
+          .create({ command: "exit 0", metadata: { sessionID: fixture.created.id } })
+          .pipe(Effect.exit),
+      ).toMatchObject({ _tag: "Failure" })
+      yield* release
+      expect((yield* fixture.shell.wait(child.id)).status).toBe("exited")
+      const proof = yield* SessionDrain.complete(request).pipe(
+        Effect.catchDefect((error) => (error instanceof SessionDrain.Busy ? Effect.fail(error) : Effect.die(error))),
+        Effect.retry({ times: 100 }),
+        Effect.timeout("5 seconds"),
+      )
+      expect(proof.phase).toBe("quiescent")
+      expect(yield* fixture.shell.list()).toEqual([])
+    }),
+  )
+
   it.live("runs shells concurrently with an active model and waits for each shell's own completion", () =>
     Effect.gen(function* () {
       const fixture = yield* setup

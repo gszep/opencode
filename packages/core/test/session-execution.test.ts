@@ -14,6 +14,8 @@ import { ProjectTable } from "@opencode/core/project/sql"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
 import { SessionExecution } from "@opencode/core/session/execution"
+import { SessionDrain } from "@opencode/core/session/drain"
+import { EventSequenceTable } from "@opencode/core/event/sql"
 import { SessionRestart } from "@opencode/core/session/execution/restart"
 import { UserInterruptedError } from "@opencode/core/session/error"
 import { SessionEvent } from "@opencode/core/session/event"
@@ -23,7 +25,10 @@ import { SessionRunner } from "@opencode/core/session/runner/index"
 import { SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Scope } from "effect"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
+import { join } from "node:path"
+import { Global } from "@opencode/util/global"
+import { tmpdirScoped } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(
@@ -33,6 +38,366 @@ const it = testEffect(
 )
 
 describe("SessionExecution lifecycle", () => {
+  it.effect("drain v1 serializes work admission with fence publication in both orders", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const first = Session.ID.make("ses_fence_admission_first")
+      const second = Session.ID.make("ses_fence_publish_first")
+      yield* seedSessions(database, [first, second])
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const admission = yield* database.db
+        .transaction(() =>
+          Effect.gen(function* () {
+            const ticket = yield* SessionDrain.enter(database.db, first, "tool")
+            yield* Deferred.succeed(entered, undefined)
+            yield* Deferred.await(release)
+            return ticket
+          }),
+        )
+        .pipe(Effect.orDie, Effect.forkScoped)
+      yield* Deferred.await(entered)
+      const request = {
+        v: 1 as const,
+        sessionID: first,
+        requestID: "00000000-0000-4000-8000-000000000040",
+        generation: 0,
+        sequence: -1,
+      }
+      const pending = yield* SessionDrain.begin(request).pipe(Effect.forkScoped)
+      yield* Deferred.succeed(release, undefined)
+      const ticket = yield* Fiber.join(admission)
+      yield* Fiber.join(pending)
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      yield* ticket.finish(Exit.void)
+      expect((yield* SessionDrain.complete(request)).phase).toBe("quiescent")
+
+      const frozen = yield* Deferred.make<void>()
+      const publish = yield* Deferred.make<void>()
+      const next = { ...request, sessionID: second, requestID: "00000000-0000-4000-8000-000000000041" }
+      const fence = yield* database.db
+        .transaction(() =>
+          Effect.gen(function* () {
+            yield* SessionDrain.begin(next)
+            yield* Deferred.succeed(frozen, undefined)
+            yield* Deferred.await(publish)
+          }),
+        )
+        .pipe(Effect.orDie, Effect.forkScoped)
+      yield* Deferred.await(frozen)
+      const late = yield* SessionDrain.enter(database.db, second, "tool").pipe(Effect.exit, Effect.forkScoped)
+      yield* Deferred.succeed(publish, undefined)
+      yield* Fiber.join(fence)
+      expect(yield* Fiber.join(late)).toMatchObject({ _tag: "Failure" })
+      expect((yield* SessionDrain.complete(next)).phase).toBe("quiescent")
+    }),
+  )
+
+  it.effect("drain v1 refuses legacy background work even without a live execution claim", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const kv = yield* KV.Service
+      const root = Session.ID.make("ses_fence_legacy_job")
+      yield* seedSessions(database, [root])
+      yield* kv.set("job.background/msg_unacknowledged", {
+        id: "job_unacknowledged",
+        notificationID: "msg_unacknowledged",
+        recovery: { kind: "shell", sessionID: root, shellID: "shell_unacknowledged", command: "synthetic" },
+        status: "running",
+        pid: 1,
+      })
+      const request = {
+        v: 1 as const,
+        sessionID: root,
+        requestID: "00000000-0000-4000-8000-000000000009",
+        generation: 0,
+        sequence: -1,
+      }
+      yield* SessionDrain.begin(request)
+      expect((yield* claims(database))[root]).toBe(false)
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      yield* kv.set("job.background/msg_unacknowledged", {
+        id: "job_unacknowledged",
+        notificationID: "msg_unacknowledged",
+        recovery: { kind: "shell", sessionID: root, shellID: "shell_unacknowledged", command: "synthetic" },
+        status: "completed",
+        pid: 1,
+      })
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+    }),
+  )
+
+  it.live("drain v1 persists proof and unresolved work across closing and reopening SQLite", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      const layer = Database.layer({ path: join(tmp.path, "fence.sqlite") }).pipe(
+        Layer.provide(Layer.succeed(Global.Service, Global.make({ data: tmp.path }))),
+      )
+      const root = Session.ID.make("ses_fence_disk")
+      const orphan = Session.ID.make("ses_fence_disk_orphan")
+      const request = {
+        v: 1 as const,
+        sessionID: root,
+        requestID: "00000000-0000-4000-8000-000000000007",
+        generation: 0,
+        sequence: -1,
+      }
+      const unknown = { ...request, sessionID: orphan, requestID: "00000000-0000-4000-8000-000000000008" }
+      yield* Effect.gen(function* () {
+        const database = yield* Database.Service
+        yield* seedSessions(database, [root, orphan])
+        yield* SessionDrain.begin(request)
+        expect((yield* SessionDrain.complete(request)).phase).toBe("quiescent")
+        expect(
+          (yield* database.db.get<{ synchronous: number }>(sql`PRAGMA synchronous`).pipe(Effect.orDie))?.synchronous,
+        ).toBe(2)
+        // Simulates a process lost after dispatch: no completion acknowledgement.
+        yield* SessionDrain.enter(database.db, orphan, "tool")
+        yield* SessionDrain.begin(unknown)
+      }).pipe(Effect.provide(Layer.fresh(layer)), Effect.scoped)
+      yield* Effect.gen(function* () {
+        const database = yield* Database.Service
+        expect((yield* SessionDrain.complete(request)).phase).toBe("quiescent")
+        expect(
+          (yield* database.db.get<{ synchronous: number }>(sql`PRAGMA synchronous`).pipe(Effect.orDie))?.synchronous,
+        ).toBe(2)
+        expect(yield* SessionDrain.enter(database.db, root, "execution").pipe(Effect.exit)).toMatchObject({
+          _tag: "Failure",
+        })
+        expect(yield* SessionDrain.complete(unknown).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+        expect((yield* SessionDrain.begin(unknown)).phase).toBe("holding")
+      }).pipe(Effect.provide(Layer.fresh(layer)), Effect.scoped)
+    }),
+  )
+
+  it.effect("drain v1 preserves queued input and rejects new admission or child creation", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const bus = yield* Bus.Service
+      const inbox = yield* SessionInbox.Service
+      const root = Session.ID.make("ses_fence_queued")
+      yield* seedSessions(database, [root])
+      yield* seedInbox(database, root, ["queue"])
+      const request = {
+        v: 1 as const,
+        sessionID: root,
+        requestID: "00000000-0000-4000-8000-000000000005",
+        generation: 0,
+        sequence: -1,
+      }
+      yield* SessionDrain.begin(request)
+      expect(
+        yield* inbox
+          .admit({
+            id: SessionMessage.ID.make("msg_denied"),
+            sessionID: root,
+            item: { type: "user", delivery: "queue", payload: { text: "must not run" } },
+          })
+          .pipe(Effect.exit),
+      ).toMatchObject({ _tag: "Failure" })
+      expect(
+        yield* bus
+          .publish(SessionEvent.Created, {
+            sessionID: Session.ID.make("ses_fence_new_child"),
+            parentID: root,
+            projectID: Project.ID.global,
+            location: { directory: AbsolutePath.make("/project") },
+            slug: "child",
+            version: "test",
+          })
+          .pipe(Effect.exit),
+      ).toMatchObject({ _tag: "Failure" })
+      expect(
+        yield* database.db
+          .select()
+          .from(SessionInboxTable)
+          .where(eq(SessionInboxTable.session_id, root))
+          .all()
+          .pipe(Effect.orDie),
+      ).toHaveLength(1)
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+    }),
+  )
+
+  it.effect("drain v1 does not infer cessation from an interrupted tool ticket", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = Session.ID.make("ses_fence_uncertain")
+      yield* seedSessions(database, [root])
+      const entered = yield* Deferred.make<void>()
+      const running = yield* SessionDrain.work(
+        database.db,
+        root,
+        "tool",
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      ).pipe(Effect.forkScoped)
+      yield* Deferred.await(entered)
+      const request = {
+        v: 1 as const,
+        sessionID: root,
+        requestID: "00000000-0000-4000-8000-000000000006",
+        generation: 0,
+        sequence: -1,
+      }
+      yield* SessionDrain.begin(request)
+      yield* Fiber.interrupt(running)
+      expect((yield* claims(database))[root]).toBe(false)
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+    }),
+  )
+
+  it.effect("drain v1 fences new execution and children, then certifies only settled owned work", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = Session.ID.make("ses_fence_root")
+      const child = Session.ID.make("ses_fence_child")
+      yield* seedSessions(database, [root])
+      yield* seedSessions(database, [child], { parent_id: root })
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const context = yield* buildExecution(scope, () =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      )
+      const execution = Context.get(context, SessionExecution.Service)
+      const running = yield* execution.resume(child).pipe(Effect.forkScoped)
+      yield* Deferred.await(entered)
+      const request = {
+        v: 1 as const,
+        sessionID: root,
+        requestID: "00000000-0000-4000-8000-000000000001",
+        generation: 0,
+        sequence: -1,
+      }
+      expect((yield* SessionDrain.begin(request)).phase).toBe("holding")
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      expect(yield* execution.resume(root).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      expect((yield* claims(database))[child]).toBe(true)
+      const contenderScope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(contenderScope, Exit.void))
+      const contender = yield* buildExecution(contenderScope, () => Effect.die("fenced contender dispatched"))
+      expect(yield* Context.get(contender, SessionExecution.Service).resume(child).pipe(Effect.exit)).toMatchObject({
+        _tag: "Failure",
+      })
+      expect((yield* claims(database))[child]).toBe(true)
+      // Rejected starts cannot release the already running child's claim.
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(running)
+      yield* execution.awaitIdle(child)
+      const proof = yield* SessionDrain.complete(request)
+      expect(proof).toEqual({ request, generation: 1, phase: "quiescent", sequence: -1 })
+      expect(yield* SessionDrain.begin(request)).toEqual(proof)
+      expect(yield* SessionDrain.complete(request)).toEqual(proof)
+      expect(yield* execution.resume(child).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      expect(yield* execution.active).toEqual(new Set())
+      yield* database.db.delete(SessionTable).where(eq(SessionTable.id, root)).run().pipe(Effect.orDie)
+      expect(yield* SessionDrain.assertOpen(database.db, child).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+    }),
+  )
+
+  it.effect("drain v1 binds the observed native sequence and never retargets a request", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = Session.ID.make("ses_fence_sequence")
+      yield* seedSessions(database, [root])
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const context = yield* buildExecution(scope, () =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      )
+      const execution = Context.get(context, SessionExecution.Service)
+      const running = yield* execution.resume(root).pipe(Effect.forkScoped)
+      yield* Deferred.await(entered)
+      const head = yield* database.db
+        .select({ seq: EventSequenceTable.seq })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, root))
+        .get()
+        .pipe(Effect.orDie)
+      if (!head) return yield* Effect.die("missing native sequence")
+      const request = {
+        v: 1 as const,
+        sessionID: root,
+        requestID: "00000000-0000-4000-8000-000000000002",
+        generation: 0,
+        sequence: head.seq,
+      }
+      expect(yield* SessionDrain.begin({ ...request, sequence: -1 }).pipe(Effect.exit)).toMatchObject({
+        _tag: "Failure",
+      })
+      const results = yield* Effect.all(
+        [request, { ...request, requestID: "00000000-0000-4000-8000-000000000003" }].map((input) =>
+          SessionDrain.begin(input).pipe(Effect.exit),
+        ),
+        { concurrency: 2 },
+      )
+      expect(results.map((result) => result._tag).sort()).toEqual(["Failure", "Success"])
+      const success = results.find(Exit.isSuccess)
+      if (!success) return yield* Effect.die("missing winning fence")
+      const selected = success.value.request
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(running)
+      const proof = yield* SessionDrain.complete(selected)
+      expect(proof.request).toEqual(selected)
+      expect(proof.sequence).toBeGreaterThan(selected.sequence)
+      expect(proof.generation).toBe(1)
+      expect(yield* SessionDrain.complete({ ...selected, generation: 1 }).pipe(Effect.exit)).toMatchObject({
+        _tag: "Failure",
+      })
+    }),
+  )
+
+  it.effect("drain v1 survives a fresh execution/recovery scope; shutdown and old claims are not proof", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const root = Session.ID.make("ses_fence_restart")
+      yield* seedSessions(database, [root])
+      const entered = yield* Deferred.make<void>()
+      const scope = yield* Scope.make()
+      const original = yield* buildExecution(scope, () =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      )
+      yield* Context.get(original, SessionExecution.Service).resume(root).pipe(Effect.forkIn(scope))
+      yield* Deferred.await(entered)
+      const head = yield* database.db
+        .select({ seq: EventSequenceTable.seq })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, root))
+        .get()
+        .pipe(Effect.orDie)
+      if (!head) return yield* Effect.die("missing native sequence")
+      const request = {
+        v: 1 as const,
+        sessionID: root,
+        requestID: "00000000-0000-4000-8000-000000000004",
+        generation: 0,
+        sequence: head.seq,
+      }
+      yield* SessionDrain.begin(request)
+      yield* Scope.close(scope, Exit.void)
+      expect((yield* claims(database))[root]).toBe(true)
+      const next = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(next, Exit.void))
+      let runs = 0
+      const restarted = yield* buildExecution(next, () =>
+        Effect.sync(() => {
+          runs++
+        }),
+      )
+      yield* Context.get(restarted, SessionRestart.Service).resumeSuspendedSessions
+      expect(runs).toBe(0)
+      expect(yield* Context.get(restarted, SessionExecution.Service).resume(root).pipe(Effect.exit)).toMatchObject({
+        _tag: "Failure",
+      })
+      expect(runs).toBe(0)
+      expect((yield* claims(database))[root]).toBe(true)
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      expect((yield* SessionDrain.begin(request)).phase).toBe("holding")
+    }),
+  )
   test("classifies success and typed failure terminals", () => {
     expect(SessionExecution.terminal(Exit.succeed(undefined))).toEqual({ type: "succeeded" })
     expect(

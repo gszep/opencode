@@ -15,6 +15,8 @@ import { PluginHooks } from "./plugin/hooks.js"
 import { SessionMessage } from "./session/message.js"
 import { SessionSchema } from "./session/schema.js"
 import { State } from "./state.js"
+import { Database } from "./database/database.js"
+import { SessionDrain } from "./session/drain.js"
 import { definition, effectiveName, execute, normalizedName, normalizeContent } from "./tool/runtime.js"
 import { Wildcard } from "./util/wildcard.js"
 
@@ -69,6 +71,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const hooks = yield* PluginHooks.Service
     const image = yield* Image.Service
+    const db = (yield* Database.Service).db
 
     type NormalizedItem = Tool.Content | "decode" | "size"
     const normalizeImages = Effect.fnUntraced(function* (content: ReadonlyArray<Tool.Content>) {
@@ -101,14 +104,19 @@ const layer = Layer.effect(
     })
 
     const beforeExecute = (name: string, input: unknown, context: Tool.Context) =>
-      hooks.trigger("tool", "execute.before", {
-        tool: name,
-        sessionID: context.sessionID,
-        agent: context.agent,
-        messageID: context.messageID,
-        id: context.id,
-        input,
-      })
+      SessionDrain.work(
+        db,
+        context.sessionID,
+        "tool",
+        hooks.trigger("tool", "execute.before", {
+          tool: name,
+          sessionID: context.sessionID,
+          agent: context.agent,
+          messageID: context.messageID,
+          id: context.id,
+          input,
+        }),
+      )
 
     const executeTool = Effect.fn("Tool.execute")(function* (
       tool: Tool.Info,
@@ -116,43 +124,52 @@ const layer = Layer.effect(
       input: unknown,
       context: Tool.Context,
     ) {
-      const execution = yield* execute(tool, input, context).pipe(
-        Effect.map((value) => ({ value })),
-        Effect.catchTag("Tool.Error", (failure) => Effect.succeed({ failure })),
+      return yield* SessionDrain.work(
+        db,
+        context.sessionID,
+        "tool",
+        Effect.gen(function* () {
+          const execution = yield* execute(tool, input, context).pipe(
+            Effect.map((value) => ({ value })),
+            Effect.catchTag("Tool.Error", (failure) => Effect.succeed({ failure })),
+          )
+          const base = {
+            tool: name,
+            sessionID: context.sessionID,
+            agent: context.agent,
+            messageID: context.messageID,
+            id: context.id,
+            input,
+          }
+          if ("failure" in execution) {
+            const afterEvent: PluginHooks.Domains["tool"]["execute.after"] = {
+              ...base,
+              status: "error",
+              error: execution.failure,
+            }
+            yield* hooks.trigger("tool", "execute.after", afterEvent)
+            return yield* afterEvent.error
+          }
+          const afterEvent: PluginHooks.Domains["tool"]["execute.after"] = {
+            ...base,
+            status: "completed",
+            result: {
+              ...(execution.value.output === undefined ? {} : { output: execution.value.output }),
+              content: execution.value.content,
+              ...(execution.value.metadata === undefined ? {} : { metadata: execution.value.metadata }),
+            },
+          }
+          yield* hooks.trigger("tool", "execute.after", afterEvent)
+          const afterContent = yield* normalizeImages(
+            normalizeContent(afterEvent.result.content, afterEvent.result.output),
+          )
+          return {
+            ...(afterEvent.result.output === undefined ? {} : { output: afterEvent.result.output }),
+            content: afterContent,
+            ...(afterEvent.result.metadata === undefined ? {} : { metadata: afterEvent.result.metadata }),
+          }
+        }),
       )
-      const base = {
-        tool: name,
-        sessionID: context.sessionID,
-        agent: context.agent,
-        messageID: context.messageID,
-        id: context.id,
-        input,
-      }
-      if ("failure" in execution) {
-        const afterEvent: PluginHooks.Domains["tool"]["execute.after"] = {
-          ...base,
-          status: "error",
-          error: execution.failure,
-        }
-        yield* hooks.trigger("tool", "execute.after", afterEvent)
-        return yield* afterEvent.error
-      }
-      const afterEvent: PluginHooks.Domains["tool"]["execute.after"] = {
-        ...base,
-        status: "completed",
-        result: {
-          ...(execution.value.output === undefined ? {} : { output: execution.value.output }),
-          content: execution.value.content,
-          ...(execution.value.metadata === undefined ? {} : { metadata: execution.value.metadata }),
-        },
-      }
-      yield* hooks.trigger("tool", "execute.after", afterEvent)
-      const afterContent = yield* normalizeImages(normalizeContent(afterEvent.result.content, afterEvent.result.output))
-      return {
-        ...(afterEvent.result.output === undefined ? {} : { output: afterEvent.result.output }),
-        content: afterContent,
-        ...(afterEvent.result.metadata === undefined ? {} : { metadata: afterEvent.result.metadata }),
-      }
     })
 
     let catalog: { data: Data; names: string; value: CodeModeCatalog.Inventory } | undefined
@@ -328,5 +345,5 @@ function namespaceError(name: string) {
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [PluginHooks.node, Image.node],
+  deps: [PluginHooks.node, Image.node, Database.node],
 })
