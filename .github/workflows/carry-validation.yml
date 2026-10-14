@@ -1,0 +1,110 @@
+name: carry-validation
+
+# Bootstrap on this fork's default branch; the reviewed implementation stays frozen.
+# Run metadata identifies the workflow ref. The separately checked TARGET_SHA below
+# identifies the source tested; this workflow never posts substitute commit statuses.
+"on":
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Open carry pull request in gszep/opencode
+        type: string
+        required: true
+      sha:
+        description: Exact reviewed 40-character head SHA
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: carry-validation-${{ inputs.pull_request }}-${{ inputs.sha }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'gszep/opencode' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET_PR: ${{ inputs.pull_request }}
+      TARGET_SHA: ${{ inputs.sha }}
+      GOMAXPROCS: "1"
+      UV_THREADPOOL_SIZE: "1"
+      npm_config_jobs: "2"
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      GIT_AUTHOR_NAME: mochi-the-kitty
+      GIT_AUTHOR_EMAIL: 306965878+mochi-the-kitty@users.noreply.github.com
+      GIT_COMMITTER_NAME: mochi-the-kitty
+      GIT_COMMITTER_EMAIL: 306965878+mochi-the-kitty@users.noreply.github.com
+    steps:
+      - name: Validate reviewed target before executing repository code
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_PR" =~ ^[1-9][0-9]*$ ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          curl --fail --silent --show-error --retry 2 --max-time 30 \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/gszep/opencode/pulls/$TARGET_PR" \
+            > "$RUNNER_TEMP/carry-pr.json"
+          jq -e --arg sha "$TARGET_SHA" --argjson pr "$TARGET_PR" '
+            .number == $pr and .state == "open" and .head.sha == $sha and
+            .head.repo.full_name == "gszep/opencode" and
+            .base.repo.full_name == "gszep/opencode"
+          ' "$RUNNER_TEMP/carry-pr.json" > /dev/null
+          printf 'Reviewed target: gszep/opencode#%s at %s\n' "$TARGET_PR" "$TARGET_SHA"
+
+      - name: Checkout exact source without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: gszep/opencode
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+
+      - name: Verify source and bounded validation contract
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          node <<'NODE'
+          const p = require('./package.json');
+          if (p.packageManager !== 'bun@1.4.2' ||
+              p.scripts.check !== 'bun run lint && bun run typecheck' ||
+              p.scripts.lint !== 'oxlint --threads=2' ||
+              p.scripts.typecheck !== 'bun turbo typecheck --concurrency=2') {
+            throw new Error('Unsupported carry validation contract');
+          }
+          NODE
+
+      - name: Setup pinned Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.4.2"
+
+      - name: Install isolated CI dependencies
+        run: bun install --frozen-lockfile --concurrent-scripts 2
+
+      - name: Install existing Linux test prerequisite
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
+      - name: Canonical lint and typecheck
+        run: bun run check
+
+      - name: Core tests with isolated HOME and XDG
+        working-directory: packages/core
+        run: bun run test --max-concurrency 1
+
+      - name: Process utility tests
+        working-directory: packages/util
+        run: bun run test --max-concurrency 1
