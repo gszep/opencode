@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: carry-validation-${{ inputs.pull_request }}-${{ inputs.sha }}
+  group: gszep-opencode-carry-validation
   cancel-in-progress: false
 
 jobs:
@@ -33,6 +33,11 @@ jobs:
     env:
       TARGET_PR: ${{ inputs.pull_request }}
       TARGET_SHA: ${{ inputs.sha }}
+      CONTROLLER_REF: ${{ github.ref }}
+      CONTROLLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+      REVIEWED_PR: "3"
+      REVIEWED_HEAD: 9985caa0785d684e72bebf19b24fa7b064edaa0c
+      REVIEWED_BASE: 7bdf3af76e7458e1cbe5f1a063a7889375ff3acf
       GOMAXPROCS: "1"
       UV_THREADPOOL_SIZE: "1"
       npm_config_jobs: "2"
@@ -47,14 +52,19 @@ jobs:
           set -euo pipefail
           [[ "$TARGET_PR" =~ ^[1-9][0-9]*$ ]]
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$CONTROLLER_REF" = refs/heads/dev
+          test "$CONTROLLER_WORKFLOW_REF" = gszep/opencode/.github/workflows/carry-validation.yml@refs/heads/dev
+          test "$TARGET_PR" = "$REVIEWED_PR"
+          test "$TARGET_SHA" = "$REVIEWED_HEAD"
           curl --fail --silent --show-error --retry 2 --max-time 30 \
             -H 'Accept: application/vnd.github+json' \
             "https://api.github.com/repos/gszep/opencode/pulls/$TARGET_PR" \
             > "$RUNNER_TEMP/carry-pr.json"
-          jq -e --arg sha "$TARGET_SHA" --argjson pr "$TARGET_PR" '
+          jq -e --arg sha "$TARGET_SHA" --argjson pr "$TARGET_PR" --arg base "$REVIEWED_BASE" '
             .number == $pr and .state == "open" and .head.sha == $sha and
             .head.repo.full_name == "gszep/opencode" and
-            .base.repo.full_name == "gszep/opencode"
+            .base.repo.full_name == "gszep/opencode" and
+            .base.ref == "carry/2.0.15-chi.1" and .base.sha == $base
           ' "$RUNNER_TEMP/carry-pr.json" > /dev/null
           printf 'Reviewed target: gszep/opencode#%s at %s\n' "$TARGET_PR" "$TARGET_SHA"
 
@@ -64,7 +74,9 @@ jobs:
           repository: gszep/opencode
           ref: ${{ inputs.sha }}
           persist-credentials: false
-          fetch-depth: 1
+          # The reviewed head is four commits above its reviewed base. A changed
+          # target must be re-reviewed, not silently deepened or retargeted.
+          fetch-depth: 8
 
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -75,6 +87,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          git cat-file -e "$REVIEWED_BASE^{commit}"
+          git merge-base --is-ancestor "$REVIEWED_BASE" "$TARGET_SHA"
           node <<'NODE'
           const p = require('./package.json');
           if (p.packageManager !== 'bun@1.4.2' ||
