@@ -17,6 +17,9 @@ uncertified background markers. Its receipt preserves the original request and
 records the final native sequence after settlement. Native sequence is not a Chi
 pin: the host still has to synchronize and verify that exact final history before
 requesting canonical transfer.
+The receipt is local to this database. The manager must bind its authenticated
+runtime/instance and checkout; detached JSON from another runtime or database is
+not drain proof for the original writer.
 
 The fence and work tickets use the existing native SQLite/KV transaction path,
 not a second database or an agent label. Execution, registered tools, owned shell
@@ -44,7 +47,8 @@ setting and process-restart persistence, not physical power-loss acceptance;
 storage and restored-backup reconciliation remain separate activation gates.
 A mixed database with unfenced old binaries is unsupported:
 drain incompatible writers before enabling the capability, and do not roll back
-to such a binary after writing fences.
+to such a binary after writing fences. Reconcile legacy work before activation;
+this does not retrospectively certify work whose old markers were already lost.
 
 ## Integration gates
 
