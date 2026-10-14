@@ -39,15 +39,13 @@ export class Unavailable extends Schema.TaggedError<Unavailable>()("SessionDrain
 }) {}
 
 // The ordinary native database uses NORMAL. A fence acknowledgement must not
-// have that power-loss rollback window; keep this connection at FULL thereafter.
+// have that power-loss rollback window; EXTRA also covers rollback-journal mode.
 const requireDurability = Effect.fn("SessionDrain.requireDurability")(function* (db: DB) {
   if (!supportsTuningPragmas) return yield* Effect.die(new Unavailable({ reason: "durability-unsupported" }))
   const before = yield* db.get<{ synchronous: number }>(sql`PRAGMA synchronous`).pipe(Effect.orDie)
-  if (before?.synchronous !== 2 && before?.synchronous !== 3)
-    yield* db.run(sql`PRAGMA synchronous = FULL`).pipe(Effect.orDie)
+  if (before?.synchronous !== 3) yield* db.run(sql`PRAGMA synchronous = EXTRA`).pipe(Effect.orDie)
   const after = yield* db.get<{ synchronous: number }>(sql`PRAGMA synchronous`).pipe(Effect.orDie)
-  if (after?.synchronous !== 2 && after?.synchronous !== 3)
-    return yield* Effect.die(new Unavailable({ reason: "durability-unavailable" }))
+  if (after?.synchronous !== 3) return yield* Effect.die(new Unavailable({ reason: "durability-unavailable" }))
 })
 
 /** Read inside the same transaction that admits work. Ancestor holds also cover
@@ -246,7 +244,7 @@ export const complete = Effect.fn("SessionDrain.complete")(function* (input: Req
           )
           .limit(1)
           .get()
-      if (claim || queued || work || background) return yield* Effect.die(new Busy({ sessionID: request.sessionID }))
+        if (claim || queued || work || background) return yield* Effect.die(new Busy({ sessionID: request.sessionID }))
         const current = yield* sequence(db, request.sessionID)
         if (saved.phase === "quiescent" && saved.sequence !== current)
           return yield* Effect.die(new Conflict({ sessionID: request.sessionID }))

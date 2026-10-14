@@ -146,11 +146,16 @@ describe("SessionExecution lifecycle", () => {
       yield* Effect.gen(function* () {
         const database = yield* Database.Service
         yield* seedSessions(database, [root, orphan])
+        // Certify in rollback-journal mode too; reopening uses the normal WAL bootstrap.
+        yield* database.db.run(sql`PRAGMA journal_mode = DELETE`).pipe(Effect.orDie)
+        expect(
+          (yield* database.db.get<{ journal_mode: string }>(sql`PRAGMA journal_mode`).pipe(Effect.orDie))?.journal_mode,
+        ).toBe("delete")
         yield* SessionDrain.begin(request)
         expect((yield* SessionDrain.complete(request)).phase).toBe("quiescent")
         expect(
           (yield* database.db.get<{ synchronous: number }>(sql`PRAGMA synchronous`).pipe(Effect.orDie))?.synchronous,
-        ).toBe(2)
+        ).toBe(3)
         // Simulates a process lost after dispatch: no completion acknowledgement.
         yield* SessionDrain.enter(database.db, orphan, "tool")
         yield* SessionDrain.begin(unknown)
@@ -160,7 +165,7 @@ describe("SessionExecution lifecycle", () => {
         expect((yield* SessionDrain.complete(request)).phase).toBe("quiescent")
         expect(
           (yield* database.db.get<{ synchronous: number }>(sql`PRAGMA synchronous`).pipe(Effect.orDie))?.synchronous,
-        ).toBe(2)
+        ).toBe(3)
         expect(yield* SessionDrain.enter(database.db, root, "execution").pipe(Effect.exit)).toMatchObject({
           _tag: "Failure",
         })

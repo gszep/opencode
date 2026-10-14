@@ -37,7 +37,8 @@ This proves cessation of runtime-owned dispatch/work, not rollback of external
 effects or supervision of arbitrary detached processes launched outside the native
 tool/job contract. Interrupted or uncertain tool operations cannot yield a receipt.
 Before acknowledging either phase, the API promotes and verifies the SQLite
-connection's synchronous setting to FULL (or retains EXTRA), keeping it there.
+connection's synchronous setting to EXTRA, keeping it there (including when WAL
+is unavailable and SQLite uses a rollback journal).
 Backends without this durability primitive are refused. Tests establish the
 setting and process-restart persistence, not physical power-loss acceptance;
 storage and restored-backup reconciliation remain separate activation gates.
