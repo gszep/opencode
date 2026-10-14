@@ -24,7 +24,7 @@ import { SessionMessage } from "@opencode/core/session/message"
 import { SessionRunner } from "@opencode/core/session/runner/index"
 import { SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Scope } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Schedule, Scope } from "effect"
 import { eq, sql } from "drizzle-orm"
 import { join } from "node:path"
 import { Global } from "@opencode/util/global"
@@ -38,6 +38,171 @@ const it = testEffect(
 )
 
 describe("SessionExecution lifecycle", () => {
+  it.live("drain review: real processes share admission fencing and hard-killed work stays unresolved", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      const filename = join(tmp.path, "process-fence.sqlite")
+      const script = join(tmp.path, "drain-worker.mjs")
+      yield* Effect.promise(() =>
+        Bun.write(
+          script,
+          `
+        import { Effect, Exit } from ${JSON.stringify(import.meta.resolve("effect"))};
+        import { Database } from ${JSON.stringify(import.meta.resolve("@opencode/core/database/database"))};
+        import { SessionDrain } from ${JSON.stringify(import.meta.resolve("@opencode/core/session/drain"))};
+        import { Session } from ${JSON.stringify(import.meta.resolve("@opencode/schema/session"))};
+        import { Global } from ${JSON.stringify(import.meta.resolve("@opencode/util/global"))};
+        const [filename, id, mode, marker] = process.argv.slice(2);
+        await Effect.runPromise(Effect.gen(function* () {
+          const db = (yield* Database.Service).db;
+          const admission = yield* SessionDrain.enter(db, Session.ID.make(id), 'tool').pipe(Effect.exit);
+          if (Exit.isFailure(admission)) {
+            yield* Effect.promise(() => Bun.write(marker + '.denied', 'denied'));
+            return;
+          }
+          yield* Effect.promise(() => Bun.write(marker + '.executed', 'owned work'));
+          if (mode === 'hold') {
+            const deadline = Date.now() + 10000;
+            while (!(yield* Effect.promise(() => Bun.file(marker + '.release').exists()))) {
+              if (Date.now() > deadline) return yield* Effect.die('fixture deadline');
+              yield* Effect.promise(() => Bun.sleep(10));
+            }
+          }
+          yield* admission.value.finish(Exit.void);
+        }).pipe(Effect.provide(Database.layer({ path: filename })),
+          Effect.provideService(Global.Service, Global.make({ data: ${JSON.stringify(tmp.path)} })), Effect.scoped));
+      `,
+        ),
+      )
+      const worker = (id: Session.ID, mode: string, marker: string) =>
+        Effect.acquireRelease(
+          Effect.sync(() => {
+            const child = Bun.spawn({
+              cmd: [process.execPath, script, filename, id, mode, marker],
+              cwd: tmp.path,
+              stdin: "ignore",
+              stdout: "pipe",
+              stderr: "pipe",
+            })
+            const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()])
+            return { child, output }
+          }),
+          ({ child, output }) =>
+            Effect.promise(async () => {
+              if (child.exitCode === null) child.kill("SIGKILL")
+              await child.exited
+              await output
+            }).pipe(Effect.orDie),
+        )
+      const waitFile = (name: string) =>
+        Effect.promise(() => Bun.file(name).exists()).pipe(
+          Effect.repeat({ until: (exists) => exists, schedule: Schedule.spaced("10 millis") }),
+          Effect.timeout("5 seconds"),
+        )
+      const layer = Database.layer({ path: filename }).pipe(
+        Layer.provide(Layer.succeed(Global.Service, Global.make({ data: tmp.path }))),
+      )
+      yield* Effect.gen(function* () {
+        const database = yield* Database.Service
+        const root = Session.ID.make("ses_process_fence")
+        const lost = Session.ID.make("ses_process_lost")
+        yield* seedSessions(database, [root, lost])
+        const marker = join(tmp.path, "first")
+        const first = yield* worker(root, "hold", marker)
+        yield* waitFile(marker + ".executed")
+        const request = {
+          v: 1 as const,
+          sessionID: root,
+          requestID: "00000000-0000-4000-8000-000000000094",
+          generation: 0,
+          sequence: -1,
+        }
+        yield* SessionDrain.begin(request)
+        expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+        yield* Effect.promise(() => Bun.write(marker + ".release", ""))
+        expect(yield* Effect.promise(() => first.child.exited)).toBe(0)
+        expect((yield* SessionDrain.complete(request)).phase).toBe("quiescent")
+        const retryMarker = join(tmp.path, "retry")
+        const retry = yield* worker(root, "try", retryMarker)
+        expect(yield* Effect.promise(() => retry.child.exited)).toBe(0)
+        expect(yield* Effect.promise(() => Bun.file(retryMarker + ".denied").exists())).toBe(true)
+        expect(yield* Effect.promise(() => Bun.file(retryMarker + ".executed").exists())).toBe(false)
+
+        const lostMarker = join(tmp.path, "lost")
+        const interrupted = yield* worker(lost, "hold", lostMarker)
+        yield* waitFile(lostMarker + ".executed")
+        const unresolved = { ...request, sessionID: lost, requestID: "00000000-0000-4000-8000-000000000095" }
+        yield* SessionDrain.begin(unresolved)
+        yield* Effect.sync(() => interrupted.child.kill("SIGKILL"))
+        expect(yield* Effect.promise(() => interrupted.child.exited)).not.toBe(0)
+        expect(yield* SessionDrain.complete(unresolved).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      }).pipe(Effect.provide(Layer.fresh(layer)), Effect.scoped)
+    }),
+  )
+
+  it.effect("drain review: settlement capability cannot admit a different input or survive its ticket", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const bus = yield* Bus.Service
+      const root = Session.ID.make("ses_settlement_capability")
+      yield* seedSessions(database, [root])
+      const ticket = yield* SessionDrain.enter(database.db, root, "session-shell")
+      const wrong = yield* SessionDrain.enter(database.db, root, "tool")
+      const inboxID = SessionMessage.ID.make("msg_owned_completion")
+      const permit = { shellID: "sh_owned_completion", inboxID }
+      const data = {
+        sessionID: root,
+        inboxID,
+        item: {
+          type: "synthetic",
+          delivery: "steer",
+          payload: { text: "completion", metadata: { source: "shell", shellID: permit.shellID } },
+        },
+      } as const
+      const request = {
+        v: 1 as const,
+        sessionID: root,
+        requestID: "00000000-0000-4000-8000-000000000093",
+        generation: 0,
+        sequence: -1,
+      }
+      yield* SessionDrain.begin(request)
+      expect(yield* bus.publish(SessionEvent.InboxEnqueued, data).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      expect(
+        yield* wrong.settle(permit, bus.publish(SessionEvent.InboxEnqueued, data)).pipe(Effect.exit),
+      ).toMatchObject({ _tag: "Failure" })
+      expect(
+        yield* ticket
+          .settle(
+            permit,
+            bus.publish(SessionEvent.InboxEnqueued, {
+              ...data,
+              inboxID: SessionMessage.ID.make("msg_different_completion"),
+            }),
+          )
+          .pipe(Effect.exit),
+      ).toMatchObject({ _tag: "Failure" })
+      expect(
+        yield* ticket
+          .settle(
+            permit,
+            bus.publish(SessionEvent.InboxEnqueued, {
+              ...data,
+              item: { type: "user", delivery: "queue", payload: { text: "new work" } },
+            }),
+          )
+          .pipe(Effect.exit),
+      ).toMatchObject({ _tag: "Failure" })
+      yield* wrong.finish(Exit.void)
+      yield* ticket.finish(Exit.void)
+      expect((yield* SessionDrain.complete(request)).phase).toBe("quiescent")
+      expect(
+        yield* ticket.settle(permit, bus.publish(SessionEvent.InboxEnqueued, data)).pipe(Effect.exit),
+      ).toMatchObject({ _tag: "Failure" })
+      expect((yield* SessionDrain.complete(request)).sequence).toBe(-1)
+    }),
+  )
+
   it.effect("drain v1 serializes work admission with fence publication in both orders", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service

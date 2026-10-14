@@ -3,8 +3,10 @@ export * as SessionDrain from "./drain.js"
 import { randomUUID } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 import { and, eq, gte, inArray, isNotNull, lt, or, sql } from "drizzle-orm"
-import { Effect, Exit, Schema } from "effect"
+import { Context, Effect, Exit, Option, Schema } from "effect"
 import { Session } from "@opencode/schema/session"
+import type { SessionEvent } from "@opencode/schema/session-event"
+import type { SessionMessage } from "@opencode/schema/session-message"
 import { NonNegativeInt } from "@opencode/schema/schema"
 import { supportsTuningPragmas } from "#sqlite"
 import { Database } from "../database/database.js"
@@ -50,50 +52,123 @@ const requireDurability = Effect.fn("SessionDrain.requireDurability")(function* 
 
 /** Read inside the same transaction that admits work. Ancestor holds also cover
  * children created before the hold; no client-supplied descendant list is trusted. */
-export const isHeld = Effect.fn("SessionDrain.isHeld")(function* (db: DB, sessionID: Session.ID) {
+const held = Effect.fn("SessionDrain.held")(function* (db: DB, sessionID: Session.ID) {
   const held = yield* db
-    .get<{ id: string }>(
+    .get<{ id: string; phase: string }>(
       sql`
     WITH RECURSIVE ancestors(id, parent_id) AS (
       SELECT ${sessionID}, (SELECT parent_id FROM session_v2 WHERE id = ${sessionID})
       UNION SELECT a.parent_id, (SELECT s.parent_id FROM session_v2 s WHERE s.id = a.parent_id)
       FROM ancestors a WHERE a.parent_id IS NOT NULL
-    ) SELECT a.id FROM ancestors a JOIN kv ON kv.key = ${prefix} || a.id LIMIT 1
+    ) SELECT a.id, json_extract(kv.value, '$.phase') AS phase
+      FROM ancestors a JOIN kv ON kv.key = ${prefix} || a.id LIMIT 1
   `,
     )
     .pipe(Effect.orDie)
-  return held !== undefined
+  return held
 })
+
+export const isHeld = (db: DB, sessionID: Session.ID) =>
+  held(db, sessionID).pipe(Effect.map((value) => value !== undefined))
 
 export const assertOpen = (db: DB, sessionID: Session.ID) =>
   isHeld(db, sessionID).pipe(Effect.flatMap((held) => (held ? Effect.die(new Held({ sessionID })) : Effect.void)))
+
+class ShellSettlement extends Context.Service<
+  ShellSettlement,
+  {
+    key: string
+    sessionID: Session.ID
+    shellID: string
+    inboxID: SessionMessage.ID
+  }
+>()("@opencode/SessionDrain/ShellSettlement") {}
+
+const Work = Schema.Struct({
+  v: Schema.Literal(1),
+  sessionID: Session.ID,
+  generation: Schema.Literal(0),
+  kind: Schema.String,
+  pid: Schema.Int,
+  state: Schema.Literal("active"),
+})
+
+/** A process-local capability for one already admitted shell's completion.
+ * It is never accepted from event data, HTTP input, labels or a receipt replay. */
+export const assertShellSettlement = Effect.fn("SessionDrain.assertShellSettlement")(function* (
+  db: DB,
+  sessionID: Session.ID,
+  shellID: string,
+) {
+  const capability = yield* Effect.serviceOption(ShellSettlement)
+  if (Option.isNone(capability) || capability.value.sessionID !== sessionID || capability.value.shellID !== shellID)
+    return yield* Effect.die(new Held({ sessionID }))
+  const fence = yield* held(db, sessionID)
+  if (fence && fence.phase !== "holding") return yield* Effect.die(new Held({ sessionID }))
+  const row = yield* db
+    .select({ value: KVTable.value })
+    .from(KVTable)
+    .where(eq(KVTable.key, capability.value.key))
+    .get()
+    .pipe(Effect.orDie)
+  const work = row ? Schema.decodeUnknownOption(Work)(row.value) : Option.none()
+  if (
+    Option.isNone(work) ||
+    work.value.sessionID !== sessionID ||
+    work.value.kind !== "session-shell" ||
+    work.value.pid !== process.pid
+  )
+    return yield* Effect.die(new Held({ sessionID }))
+  return capability.value
+})
+
+export const assertInboxAdmission = Effect.fn("SessionDrain.assertInboxAdmission")(function* (
+  db: DB,
+  input: (typeof SessionEvent.InboxEnqueued.Type)["data"],
+) {
+  if (!(yield* isHeld(db, input.sessionID))) return
+  if (
+    input.item.type !== "synthetic" ||
+    input.item.payload.metadata?.source !== "shell" ||
+    typeof input.item.payload.metadata.shellID !== "string"
+  )
+    return yield* Effect.die(new Held({ sessionID: input.sessionID }))
+  const permit = yield* assertShellSettlement(db, input.sessionID, input.item.payload.metadata.shellID)
+  if (permit.inboxID !== input.inboxID) return yield* Effect.die(new Held({ sessionID: input.sessionID }))
+})
 
 /** The ticket precedes actual dispatch. A crash or uncertain tool exit leaves
  * evidence of outstanding work; PID death and idle status never erase it. */
 export const enter = Effect.fn("SessionDrain.enter")(function* (
   db: DB,
   sessionID: Session.ID,
-  kind: "execution" | "tool" | "shell" | "job",
+  kind: "execution" | "tool" | "shell" | "job" | "session-shell",
 ) {
   const key = `${workPrefix}${sessionID}/${randomUUID()}`
+  const value = { v: 1, sessionID, generation: 0, kind, pid: process.pid, state: "active" }
   yield* db
     .transaction(() =>
       Effect.gen(function* () {
         yield* assertOpen(db, sessionID)
-        yield* db
-          .insert(KVTable)
-          .values({ key, value: { v: 1, sessionID, generation: 0, kind, pid: process.pid } })
-          .run()
+        yield* db.insert(KVTable).values({ key, value }).run()
       }),
     )
     .pipe(Effect.orDie)
   return {
-    // Failed/cancelled work remains unresolved: its status or transport error
-    // cannot establish whether external effects stopped. Never expire tickets.
+    // The current spawner only observes the direct process. Even a successful
+    // scope exit cannot certify its owned descendants, so shell tickets persist.
+    // Failed/cancelled work likewise remains unresolved. Never expire tickets.
     finish: (exit: Exit.Exit<unknown, unknown>) =>
-      Exit.isSuccess(exit)
+      Exit.isSuccess(exit) && kind !== "shell"
         ? db.delete(KVTable).where(eq(KVTable.key, key)).run().pipe(Effect.orDie, Effect.asVoid)
-        : Effect.void,
+        : db
+            .update(KVTable)
+            .set({ value: { ...value, state: "unresolved" } })
+            .where(eq(KVTable.key, key))
+            .run()
+            .pipe(Effect.orDie, Effect.asVoid),
+    settle: <A, E, R>(input: { shellID: string; inboxID: SessionMessage.ID }, effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(Effect.provideService(ShellSettlement, { key, sessionID, ...input })),
   }
 })
 

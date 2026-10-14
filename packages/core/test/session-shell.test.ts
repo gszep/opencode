@@ -1,7 +1,7 @@
-import { describe, expect, setDefaultTimeout } from "bun:test"
+import { describe, expect, setDefaultTimeout, spyOn } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Stream } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Schema, Stream } from "effect"
 import { Bus } from "@opencode/core/bus"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { Location } from "@opencode/core/location"
@@ -15,7 +15,8 @@ import { Shell } from "@opencode/core/shell"
 import { Database } from "@opencode/core/database/database"
 import { EventSequenceTable } from "@opencode/core/event/sql"
 import { SessionDrain } from "@opencode/core/session/drain"
-import { eq } from "drizzle-orm"
+import { and, eq, gte, lt } from "drizzle-orm"
+import { KVTable } from "@opencode/core/kv/sql"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { location } from "./fixture/location"
 import { offlineModels } from "./fixture/models"
@@ -113,7 +114,210 @@ const launch = Effect.fn(function* (fixture: Effect.Success<typeof setup>, name:
 })
 
 describe("Session.shell", () => {
-  it.live("drain v1 observes a real owned shell exit rather than an idle agent or remove acknowledgement", () =>
+  it.live("drain review: an exited leader cannot certify while its owned grandchild can still write", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup
+      const db = (yield* Database.Service).db
+      const file = (name: string) => path.join(fixture.tmp.path, name)
+      const waitFile = (name: string) =>
+        Effect.promise(() => Bun.file(file(name)).exists()).pipe(
+          Effect.repeat({ until: (exists) => exists, schedule: Schedule.spaced("10 millis") }),
+          Effect.timeout("5 seconds"),
+        )
+      const release = Effect.promise(() => Bun.write(file("grandchild.release"), ""))
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          yield* release
+          yield* waitFile("grandchild.finished")
+          const pid = Number(yield* Effect.promise(() => Bun.file(file("grandchild.pid")).text()))
+          if (!Number.isSafeInteger(pid) || pid <= 1) return yield* Effect.die("invalid fixture-owned pid")
+          // Only observe this fixture's reported PID; never signal other processes.
+          yield* Effect.sync(() => {
+            try {
+              process.kill(pid, 0)
+              return false
+            } catch (error) {
+              if (error instanceof Error && "code" in error && error.code === "ESRCH") return true
+              throw error
+            }
+          }).pipe(
+            Effect.repeat({ until: (gone) => gone, schedule: Schedule.spaced("10 millis") }),
+            Effect.timeout("5 seconds"),
+          )
+        }).pipe(Effect.orDie),
+      )
+      yield* Effect.promise(() =>
+        Bun.write(
+          file("grandchild.mjs"),
+          `
+        import { spawn } from 'node:child_process';
+        import { existsSync, writeFileSync } from 'node:fs';
+        if (process.argv[2] !== 'child') {
+          const child = spawn(process.execPath, ['grandchild.mjs', 'child'], { stdio: 'ignore' });
+          child.unref(); process.exit(0);
+        }
+        writeFileSync('grandchild.pid', String(process.pid));
+        writeFileSync('grandchild.started', '');
+        const deadline = Date.now() + 10000;
+        while (!existsSync('grandchild.release') && Date.now() < deadline) await Bun.sleep(10);
+        if (existsSync('grandchild.release')) writeFileSync('grandchild.wrote', 'after leader exit');
+        writeFileSync('grandchild.finished', '');
+        process.exit(0);
+      `,
+        ),
+      )
+      const command = `${process.platform === "win32" ? "& " : ""}${JSON.stringify(process.execPath.replaceAll("\\", "/"))} grandchild.mjs`
+      const child = yield* fixture.shell.create({
+        command,
+        cwd: fixture.tmp.path,
+        metadata: { sessionID: fixture.created.id },
+        timeout: 0,
+      })
+      yield* waitFile("grandchild.started")
+      expect((yield* fixture.shell.wait(child.id)).exit).toBe(0)
+      // Observe scope completion, not an elapsed-time approximation. The fixed
+      // kernel retains an unresolved ticket; the old code deleted this row.
+      const work = () =>
+        db
+          .select({ value: KVTable.value })
+          .from(KVTable)
+          .where(
+            and(
+              gte(KVTable.key, `session.work/${fixture.created.id}/`),
+              lt(KVTable.key, `session.work/${fixture.created.id}/\uffff`),
+            ),
+          )
+          .all()
+          .pipe(
+            Effect.orDie,
+            Effect.map((rows) =>
+              rows.map((row) =>
+                Schema.decodeUnknownSync(
+                  Schema.Struct({ kind: Schema.String, state: Schema.optionalKey(Schema.String) }),
+                )(row.value),
+              ),
+            ),
+          )
+      yield* work().pipe(
+        Effect.repeat({
+          until: (rows) => rows.length === 0 || rows.every((row) => row.state === "unresolved"),
+          schedule: Schedule.spaced("10 millis"),
+        }),
+        Effect.timeout("5 seconds"),
+      )
+      const head = yield* db
+        .select({ seq: EventSequenceTable.seq })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, fixture.created.id))
+        .get()
+        .pipe(Effect.orDie)
+      if (!head) return yield* Effect.die("missing native sequence")
+      const request = {
+        v: 1 as const,
+        sessionID: fixture.created.id,
+        requestID: "00000000-0000-4000-8000-000000000091",
+        generation: 0,
+        sequence: head.seq,
+      }
+      yield* SessionDrain.begin(request)
+      const early = yield* SessionDrain.complete(request).pipe(Effect.exit)
+      yield* release
+      yield* waitFile("grandchild.wrote")
+      expect(early).toMatchObject({ _tag: "Failure" })
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+    }),
+  )
+
+  it.live("drain review: admitted Session.shell settlement completes under the fence without new work", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup
+      const db = (yield* Database.Service).db
+      const reading = yield* Deferred.make<void>()
+      const releaseRead = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(releaseRead, undefined))
+      const output = fixture.shell.output
+      const delayed = spyOn(fixture.shell, "output").mockImplementation((...args) =>
+        Deferred.succeed(reading, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseRead)),
+          Effect.andThen(output(...args)),
+        ),
+      )
+      yield* Effect.addFinalizer(() => Effect.sync(() => delayed.mockRestore()))
+      const running = yield* launch(fixture, "settlement")
+      const head = yield* db
+        .select({ seq: EventSequenceTable.seq })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, fixture.created.id))
+        .get()
+        .pipe(Effect.orDie)
+      if (!head) return yield* Effect.die("missing native sequence")
+      const request = {
+        v: 1 as const,
+        sessionID: fixture.created.id,
+        requestID: "00000000-0000-4000-8000-000000000092",
+        generation: 0,
+        sequence: head.seq,
+      }
+      yield* SessionDrain.begin(request)
+      yield* running.release
+      yield* Deferred.await(reading).pipe(Effect.timeout("5 seconds"))
+      const rows = yield* db
+        .select({ value: KVTable.value })
+        .from(KVTable)
+        .where(
+          and(
+            gte(KVTable.key, `session.work/${fixture.created.id}/`),
+            lt(KVTable.key, `session.work/${fixture.created.id}/\uffff`),
+          ),
+        )
+        .all()
+        .pipe(Effect.orDie)
+      const early = yield* SessionDrain.complete(request).pipe(Effect.exit)
+      expect(
+        yield* fixture.session
+          .synthetic({
+            sessionID: fixture.created.id,
+            text: "forged completion",
+            metadata: { source: "shell", shellID: running.shellID },
+            resume: false,
+          })
+          .pipe(Effect.exit),
+      ).toMatchObject({ _tag: "Failure" })
+      yield* Deferred.succeed(releaseRead, undefined)
+      expect(yield* Fiber.join(running.caller).pipe(Effect.exit)).toMatchObject({ _tag: "Success" })
+      expect(early).toMatchObject({ _tag: "Failure" })
+      expect(
+        rows.map((row) => Schema.decodeUnknownSync(Schema.Struct({ kind: Schema.String }))(row.value).kind),
+      ).toContain("session-shell")
+      const messages = yield* fixture.session.messages({ sessionID: fixture.created.id, order: "asc" })
+      expect(messages).toMatchObject([
+        { type: "shell", shellID: running.shellID, status: "exited" },
+        {
+          type: "synthetic",
+          text: expect.stringContaining("settlement finished"),
+          metadata: { source: "shell", shellID: running.shellID },
+        },
+      ])
+      expect(yield* fixture.session.inbox(fixture.created.id)).toEqual([])
+      expect(fixture.control.wakes).toEqual([])
+      const settled = yield* db
+        .select({ seq: EventSequenceTable.seq })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, fixture.created.id))
+        .get()
+        .pipe(Effect.orDie)
+      expect(settled?.seq).toBe(request.sequence + 3)
+      expect(
+        yield* fixture.session
+          .synthetic({ sessionID: fixture.created.id, text: "unrelated", resume: false })
+          .pipe(Effect.exit),
+      ).toMatchObject({ _tag: "Failure" })
+      // The unproved process-family ticket is still a separate barrier.
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+    }),
+  )
+
+  it.live("drain v1 retains unresolved shell ownership even after its leader exits", () =>
     Effect.gen(function* () {
       const fixture = yield* setup
       const database = yield* Database.Service
@@ -159,12 +363,7 @@ describe("Session.shell", () => {
       ).toMatchObject({ _tag: "Failure" })
       yield* release
       expect((yield* fixture.shell.wait(child.id)).status).toBe("exited")
-      const proof = yield* SessionDrain.complete(request).pipe(
-        Effect.catchDefect((error) => (error instanceof SessionDrain.Busy ? Effect.fail(error) : Effect.die(error))),
-        Effect.retry({ times: 100 }),
-        Effect.timeout("5 seconds"),
-      )
-      expect(proof.phase).toBe("quiescent")
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
       expect(yield* fixture.shell.list()).toEqual([])
     }),
   )

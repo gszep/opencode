@@ -24,11 +24,25 @@ not drain proof for the original writer.
 The fence and work tickets use the existing native SQLite/KV transaction path,
 not a second database or an agent label. Execution, registered tools, owned shell
 process scopes and session-owned jobs record admission before dispatch. Successful
-work removes its ticket only after its owned scope settles. Failures, interruption
+non-shell work removes its ticket only after its owned scope settles. Failures, interruption
 or process death retain unresolved tickets. No timer, PID probe, idle observation,
 interrupt acknowledgement or connection close clears them. This conservative first
 slice may require recovery even after a harmless tool failure; it has no automatic
 recovery, fence release or readmission operation.
+
+**Owned shell families remain unresolved even on a successful leader/scope exit.**
+The current spawner does not prove that descendants have ceased; an ordinary
+background grandchild launched by `Shell.Service.create` is inside this contract,
+not an external-work exclusion. V1 cannot certify a session containing such shell
+tickets until a reviewed supervisor supplies cessation evidence. Do not clear
+these tickets based on leader exit, status, output EOF or elapsed time.
+
+The admitted `Session.shell` operation has a separate ticket through output
+reading, `Shell.Ended` and its durable completion notice. A process-local,
+ticket-bound settlement capability permits only that completion under a holding
+fence. The notice is delivered into history without waking execution or promoting
+other queued input. New synthetic/user admissions and stale settlement capabilities
+remain refused. Ordinary unfenced completion still queues its normal notice.
 
 Root fences also reject descendant admission, retained tool snapshots and fresh
 execution owners after database reopening. Existing input is not silently dropped;
@@ -43,7 +57,9 @@ Before acknowledging either phase, the API promotes and verifies the SQLite
 connection's synchronous setting to EXTRA, keeping it there (including when WAL
 is unavailable and SQLite uses a rollback journal).
 Backends without this durability primitive are refused. Tests establish the
-setting and process-restart persistence, not physical power-loss acceptance;
+setting and SQLite close/reopen persistence. Separate real-process tests exercise
+shared-database admission and refusal after an owned worker is hard-killed; they
+do not establish positive descendant cessation or physical power-loss acceptance;
 storage and restored-backup reconciliation remain separate activation gates.
 A mixed database with unfenced old binaries is unsupported:
 drain incompatible writers before enabling the capability, and do not roll back

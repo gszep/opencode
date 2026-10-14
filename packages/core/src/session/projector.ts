@@ -643,7 +643,7 @@ const layer = Layer.effectDiscard(
     )
     yield* bus.project(SessionEvent.InboxEnqueued, (event) =>
       Effect.gen(function* () {
-        yield* SessionDrain.assertOpen(db, event.data.sessionID)
+        yield* SessionDrain.assertInboxAdmission(db, event.data)
         yield* SessionInbox.projectAdmitted(db, {
           enqueuedSeq: event.durable.seq,
           id: event.data.inboxID,
