@@ -1,5 +1,7 @@
 export * as SessionExecution from "./execution.js"
 
+import { SessionDrain } from "./drain.js"
+
 import { Cause, Context, Effect, Exit, Layer } from "effect"
 import { eq } from "drizzle-orm"
 import { Bus } from "../bus.js"
@@ -81,6 +83,7 @@ export const layer = Layer.effect(
     const bus = yield* Bus.Service
     const jobs = yield* Job.Service
     const db = (yield* Database.Service).db
+    const tickets = new Map<SessionSchema.ID, Effect.Success<ReturnType<typeof SessionDrain.enter>>>()
     const reportLifecycle = <A>(sessionID: SessionSchema.ID, effect: Effect.Effect<A>) =>
       effect.pipe(
         Effect.tapCause((cause) =>
@@ -131,7 +134,13 @@ export const layer = Layer.effect(
       started: (sessionID) =>
         reportLifecycle(
           sessionID,
-          bus.publish(SessionEvent.Execution.Started, { sessionID }, claimOnCommit(sessionID)),
+          Effect.gen(function* () {
+            const ticket = yield* SessionDrain.enter(db, sessionID, "execution")
+            yield* bus
+              .publish(SessionEvent.Execution.Started, { sessionID }, claimOnCommit(sessionID))
+              .pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? ticket.finish(Exit.void) : Effect.void)))
+            tickets.set(sessionID, ticket)
+          }),
         ),
       drain: (sessionID, force, promotable) => drain(sessionID, force, undefined, promotable),
       // One terminal observation per busy period, covering every coalesced drain.
@@ -139,6 +148,8 @@ export const layer = Layer.effect(
         reportLifecycle(
           sessionID,
           Effect.gen(function* () {
+            // A failed admission must not terminalize or release another owner.
+            if (!tickets.has(sessionID)) return
             const outcome = terminal(exit, reason)
             if (outcome.type === "succeeded") {
               yield* bus.publish(SessionEvent.Execution.Succeeded, { sessionID }, releaseOnCommit(sessionID))
@@ -162,7 +173,15 @@ export const layer = Layer.effect(
               },
               releaseOnCommit(sessionID),
             )
-          }),
+          }).pipe(
+            Effect.ensuring(
+              Effect.suspend(() => {
+                const ticket = tickets.get(sessionID)
+                tickets.delete(sessionID)
+                return ticket ? ticket.finish(exit) : Effect.void
+              }),
+            ),
+          ),
         ),
     })
 

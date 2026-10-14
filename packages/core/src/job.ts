@@ -6,6 +6,8 @@ import { Identifier } from "./id/id.js"
 import { KV } from "./kv.js"
 import { SessionMessage } from "./session/message.js"
 import { SessionSchema } from "./session/schema.js"
+import { Database } from "./database/database.js"
+import { SessionDrain } from "./session/drain.js"
 
 const Background = Schema.Struct({
   id: Schema.String,
@@ -29,6 +31,7 @@ const Background = Schema.Struct({
   output: Schema.optionalKey(Schema.String),
   error: Schema.optionalKey(Schema.String),
   pid: Schema.optionalKey(Schema.Int),
+  drainVersion: Schema.optionalKey(Schema.Literal(1)),
 })
 
 export type Background = typeof Background.Type
@@ -61,6 +64,7 @@ type Active = {
   isBackgrounded: boolean
   consumed: boolean
   recovery?: Recovery
+  ticket?: Effect.Success<ReturnType<typeof SessionDrain.enter>>
 }
 
 type State = {
@@ -73,6 +77,7 @@ type FinishResult = {
   done?: Deferred.Deferred<Info>
   scope?: Scope.Closeable
   generation?: Scope.Closeable
+  finish?: Effect.Effect<void>
 }
 
 type BackgroundResult = {
@@ -179,6 +184,7 @@ function decrementSession(input: Map<SessionSchema.ID, number>, sessionID: Sessi
  */
 export const make = Effect.gen(function* () {
   const kv = yield* KV.Service
+  const db = (yield* Database.Service).db
   const state: State = {
     jobs: yield* SynchronizedRef.make(new Map()),
     scope: yield* Scope.Scope,
@@ -207,6 +213,7 @@ export const make = Effect.gen(function* () {
       ...(job.info.output !== undefined ? { output: job.info.output } : {}),
       ...(job.info.error !== undefined ? { error: job.info.error } : {}),
       ...(process.pid !== undefined ? { pid: process.pid } : {}),
+      ...(job.ticket ? { drainVersion: 1 } : {}),
     })
   })
 
@@ -236,12 +243,18 @@ export const make = Effect.gen(function* () {
           },
         }
         if (status !== "cancelled") yield* persistBackground(next)
-        return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
+        return [
+          { info: snapshot(next), done: job.done, scope: job.scope, finish: job.ticket?.finish(exit) },
+          new Map(jobs).set(id, next),
+        ]
       }),
     )
     if (result.info && result.done) yield* Deferred.succeed(result.done, result.info)
     if (result.scope) {
-      yield* Scope.close(result.scope, Exit.void).pipe(Effect.forkIn(state.scope, { startImmediately: true }))
+      yield* Scope.close(result.scope, Exit.void).pipe(
+        Effect.andThen(result.finish ?? Effect.void),
+        Effect.forkIn(state.scope, { startImmediately: true }),
+      )
     }
     return result.info
   })
@@ -266,6 +279,13 @@ export const make = Effect.gen(function* () {
             if (existing?.info.status === "running") {
               return [{ info: snapshot(existing) }, jobs]
             }
+            const owner =
+              input.recovery?.kind === "shell"
+                ? input.recovery.sessionID
+                : input.recovery?.kind === "subagent"
+                  ? input.recovery.childSessionID
+                  : input.metadata?.sessionID
+            const ticket = Schema.is(SessionSchema.ID)(owner) ? yield* SessionDrain.enter(db, owner, "job") : undefined
             const scope = yield* Scope.fork(state.scope, "parallel")
             const job = {
               info: {
@@ -284,6 +304,7 @@ export const make = Effect.gen(function* () {
               isBackgrounded: false,
               consumed: false,
               recovery: input.recovery,
+              ticket,
             }
             return [{ info: snapshot(job), scope }, new Map(jobs).set(id, job)]
           }),
@@ -481,4 +502,4 @@ export const make = Effect.gen(function* () {
 
 const layer = Layer.effect(Service, make)
 
-export const node = makeGlobalNode({ service: Service, layer, deps: [KV.node] })
+export const node = makeGlobalNode({ service: Service, layer, deps: [KV.node, Database.node] })

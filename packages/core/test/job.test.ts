@@ -1,16 +1,86 @@
 import { describe, expect } from "bun:test"
 import { Job } from "@opencode/core/job"
+import { Database } from "@opencode/core/database/database"
 import { KV } from "@opencode/core/kv"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { Integration } from "@opencode/core/integration"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Cause, Deferred, Effect, Exit, Fiber, Scope } from "effect"
 import { SessionSchema } from "@opencode/core/session/schema"
+import { SessionDrain } from "@opencode/core/session/drain"
+import { SessionTable } from "@opencode/core/session/sql"
+import { ProjectTable } from "@opencode/core/project/sql"
+import { Project } from "@opencode/schema/project"
+import { AbsolutePath } from "@opencode/schema/schema"
 import { testEffect } from "./lib/effect"
 
-const it = testEffect(AppNodeBuilder.build(LayerNode.group([Job.node, KV.node])))
+const it = testEffect(AppNodeBuilder.build(LayerNode.group([Job.node, KV.node, Database.node])))
 
 describe("Job", () => {
+  it.live("drain v1 waits for owned job work and refuses background recovery under the fence", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const jobs = yield* Job.Service
+      const sessionID = SessionSchema.ID.make("ses_job_fence")
+      yield* database.db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      yield* database.db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          directory: "/project",
+          slug: "job-fence",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+      const gate = yield* Deferred.make<void>()
+      const job = yield* jobs.start({
+        type: "shell",
+        recovery: { kind: "shell", sessionID, shellID: "shell_fence", command: "synthetic" },
+        run: Deferred.await(gate).pipe(Effect.as("finished")),
+      })
+      yield* jobs.background(job.id)
+      const request = {
+        v: 1 as const,
+        sessionID,
+        requestID: "00000000-0000-4000-8000-000000000010",
+        generation: 0,
+        sequence: -1,
+      }
+      yield* SessionDrain.begin(request)
+      expect(yield* SessionDrain.complete(request).pipe(Effect.exit)).toMatchObject({ _tag: "Failure" })
+      yield* Deferred.succeed(gate, undefined)
+      expect((yield* jobs.wait({ id: job.id })).info?.status).toBe("completed")
+      // Job's public terminal notification precedes scope finalization. The
+      // fence polls its durable work ticket instead of trusting that status.
+      const proof = yield* SessionDrain.complete(request).pipe(
+        Effect.catchDefect((error) => (error instanceof SessionDrain.Busy ? Effect.fail(error) : Effect.die(error))),
+        Effect.retry({ times: 100 }),
+        Effect.timeout(5_000),
+      )
+      expect(proof.phase).toBe("quiescent")
+      let executed = false
+      expect(
+        yield* jobs
+          .start({
+            type: "shell",
+            recovery: { kind: "shell", sessionID, shellID: "other", command: "synthetic" },
+            run: Effect.sync(() => {
+              executed = true
+              return "wrong"
+            }),
+          })
+          .pipe(Effect.exit),
+      ).toMatchObject({ _tag: "Failure" })
+      expect(executed).toBe(false)
+    }),
+  )
+
   it.live("tracks process-local work through explicit observation", () =>
     Effect.gen(function* () {
       const jobs = yield* Job.Service

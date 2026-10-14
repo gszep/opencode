@@ -49,7 +49,7 @@ Type safety ends at registration. The registry validates model input and declare
 
 ## Permissions
 
-The registry has no `Permission.Service` dependency and performs no execution authorization. Registration options may attach a permission action solely to preserve whole-tool definition filtering. Most registrations default to their effective name; `edit`, `write`, and `patch` use the shared `edit` action.
+The registry has no `Permission.Service` dependency and does not decide leaf permissions. Its native `SessionDrain` lifecycle barrier prevents dispatch into a fenced session and tracks owned work through settlement; it grants no tool permission. Registration options may attach a permission action solely to preserve whole-tool definition filtering. Most registrations default to their effective name; `edit`, `write`, and `patch` use the shared `edit` action.
 
 Tool filtering is catalog visibility, not execution authorization. A call still executes the captured tool's leaf policy if it reaches execution.
 

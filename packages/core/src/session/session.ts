@@ -30,6 +30,7 @@ import { SessionShell } from "./shell.js"
 import { SessionSkill } from "./skill.js"
 import { SessionSchema } from "./schema.js"
 import { SessionStore } from "./store.js"
+import { SessionDrain } from "./drain.js"
 
 type PromptRequest = SessionPrompt.Input & {
   id?: SessionMessage.ID
@@ -183,42 +184,71 @@ export const make = Effect.fn("Session.make")(function* () {
   ) {
     const session = yield* get(sessionID)
     // The server owns completion recording even if the submitting client disconnects.
-    const running = yield* Effect.gen(function* () {
-      const started = yield* SessionShell.start({ session, command: input.command }).pipe(
-        Effect.provideService(Instance.Service, instances),
-        Effect.tapError((error) =>
-          synthetic(sessionID, {
-            text: `User shell command failed to start:\n${input.command}\n\n${error.message}`,
-            description: input.command,
-            metadata: { source: "shell", state: "error" },
-            resume: false,
+    const running = yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const ticket = yield* SessionDrain.enter(database.db, sessionID, "session-shell")
+        return yield* restore(
+          Effect.gen(function* () {
+            const started = yield* SessionShell.start({ session, command: input.command }).pipe(
+              Effect.provideService(Instance.Service, instances),
+              Effect.tapError((error) =>
+                synthetic(sessionID, {
+                  text: `User shell command failed to start:\n${input.command}\n\n${error.message}`,
+                  description: input.command,
+                  metadata: { source: "shell", state: "error" },
+                  resume: false,
+                }),
+              ),
+              Effect.orDie,
+            )
+            yield* bus.publish(
+              SessionEvent.Shell.Started,
+              {
+                sessionID,
+                shell: started.info,
+              },
+              { id: input.id ? Event.ID.make(input.id.replace(/^msg_/, "evt_")) : undefined },
+            )
+            const terminal = yield* started.result
+            const preview = yield* started.output
+            const inboxID = SessionMessage.ID.create()
+            const events = [
+              [
+                SessionEvent.Shell.Ended,
+                { sessionID, shell: terminal.info, output: preview },
+                {
+                  commit: () =>
+                    SessionDrain.assertShellSettlement(database.db, sessionID, started.info.id).pipe(Effect.asVoid),
+                },
+              ],
+              [
+                SessionEvent.InboxEnqueued,
+                {
+                  sessionID,
+                  inboxID,
+                  item: {
+                    type: "synthetic",
+                    delivery: "steer",
+                    payload: SessionInbox.SyntheticPayload.make(ShellResult.userNotification(terminal)),
+                  },
+                },
+              ],
+            ] as const
+            const frozen = yield* SessionDrain.isHeld(database.db, sessionID)
+            // Complete only this admitted operation. Under a fence the notice enters
+            // history in the same transaction, without promoting other queued work or
+            // waking execution. A fence racing the unfenced branch leaves a normal
+            // queued completion, which continues to block certification.
+            yield* ticket.settle(
+              { shellID: started.info.id, inboxID },
+              frozen
+                ? bus.publishAll([...events, [SessionEvent.InboxDelivered, { sessionID, inboxID }]]).pipe(Effect.asVoid)
+                : bus.publishAll(events).pipe(Effect.asVoid),
+            )
           }),
-        ),
-        Effect.orDie,
-      )
-      yield* bus.publish(
-        SessionEvent.Shell.Started,
-        {
-          sessionID,
-          shell: started.info,
-        },
-        { id: input.id ? Event.ID.make(input.id.replace(/^msg_/, "evt_")) : undefined },
-      )
-      const terminal = yield* started.result
-      const preview = yield* started.output
-      yield* bus.publish(SessionEvent.Shell.Ended, {
-        sessionID,
-        shell: terminal.info,
-        output: preview,
-      })
-      yield* synthetic(sessionID, {
-        ...ShellResult.userNotification(terminal),
-        resume: false,
-      }).pipe(
-        Effect.catchTag("Session.NotFoundError", () => Effect.void),
-        Effect.orDie,
-      )
-    }).pipe(Effect.forkIn(scope, { startImmediately: true }))
+        ).pipe(Effect.onExit((exit) => ticket.finish(exit)))
+      }),
+    ).pipe(Effect.forkIn(scope, { startImmediately: true }))
     yield* Fiber.join(running)
   })
   const skill = Effect.fn("Session.skill")(function* (
