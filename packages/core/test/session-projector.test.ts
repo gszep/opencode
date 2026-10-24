@@ -23,12 +23,7 @@ import { fromRow } from "@opencode/core/session/info"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionStore } from "@opencode/core/session/store"
 import { Shell } from "@opencode/schema/shell"
-import {
-  InstructionStateTable,
-  SessionInboxTable,
-  SessionMessageTable,
-  SessionTable,
-} from "@opencode/core/session/sql"
+import { InstructionStateTable, SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode/core/snapshot"
 
@@ -85,6 +80,94 @@ const seedSession = (overrides?: Partial<typeof SessionTable.$inferInsert>) =>
   })
 
 describe("SessionProjector", () => {
+  it.effect("forks only assistants whose steps and tools have settled", () =>
+    Effect.gen(function* () {
+      yield* seedSession()
+      const bus = yield* Bus.Service
+      const store = yield* SessionStore.Service
+      const statuses = ["completed", "running", "streaming"] as const
+      for (const status of statuses) {
+        const assistantMessageID = SessionMessage.ID.make(`msg_fork_${status}`)
+        yield* bus.publish(SessionEvent.Step.Started, {
+          sessionID,
+          assistantMessageID,
+          agent: build,
+          model,
+          started: 0,
+        })
+        yield* bus.publish(SessionEvent.Tool.Input.Started, {
+          sessionID,
+          assistantMessageID,
+          id: status,
+          name: "web_search",
+        })
+        if (status !== "streaming")
+          yield* bus.publish(SessionEvent.Tool.Called, {
+            sessionID,
+            assistantMessageID,
+            id: status,
+            input: { query: "Effect" },
+            executed: true,
+          })
+        if (status === "completed")
+          yield* bus.publish(SessionEvent.Tool.Success, {
+            sessionID,
+            assistantMessageID,
+            id: status,
+            content: [{ type: "text", text: "Found" }],
+            executed: true,
+          })
+        yield* bus.publish(SessionEvent.Step.Ended, {
+          sessionID,
+          assistantMessageID,
+          finish: "tool-calls",
+          rawFinish: "tool_use",
+          cost: Money.USD.zero,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        })
+      }
+      const forkID = Session.ID.make("ses_fork_pending_hosted")
+      const boundary = { type: "through" as const, messageID: SessionMessage.ID.make("msg_fork_streaming") }
+      yield* bus.publish(SessionEvent.Forked, { sessionID: forkID, parentID: sessionID, boundary })
+      const fork = yield* store.context(forkID)
+      expect(fork).toHaveLength(1)
+      expect(fork[0]).toMatchObject({
+        type: "assistant",
+        content: [{ id: "completed", state: { status: "completed" } }],
+      })
+
+      for (const status of ["running", "streaming"] as const) {
+        const assistantMessageID = SessionMessage.ID.make(`msg_fork_${status}`)
+        if (status === "streaming")
+          yield* bus.publish(SessionEvent.Tool.Called, {
+            sessionID,
+            assistantMessageID,
+            id: status,
+            input: { query: "Effect" },
+            executed: true,
+          })
+        yield* bus.publish(SessionEvent.Tool.Success, {
+          sessionID,
+          assistantMessageID,
+          id: status,
+          content: [{ type: "text", text: "Found later" }],
+          executed: true,
+        })
+      }
+      expect(yield* store.context(forkID)).toEqual(fork)
+      const settledID = Session.ID.make("ses_fork_settled_hosted")
+      yield* bus.publish(SessionEvent.Forked, { sessionID: settledID, parentID: sessionID, boundary })
+      const settled = yield* store.context(settledID)
+      expect(settled).toHaveLength(3)
+      expect(settled).toMatchObject(
+        statuses.map((id) => ({
+          type: "assistant",
+          content: [{ id, state: { status: "completed" } }],
+        })),
+      )
+    }),
+  )
+
   it.effect("does not settle a pending manual compaction on an auto failure", () =>
     Effect.gen(function* () {
       const db = yield* seedSession()
