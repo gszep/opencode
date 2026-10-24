@@ -67,6 +67,7 @@ import type { Info as ToolInfo } from "@opencode/schema/tool"
 import { InstructionStateTable, SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { InstructionEntry } from "@opencode/core/session/instruction-entry"
 import { SessionStore } from "@opencode/core/session/store"
+import { SessionTransfer } from "@opencode/core/session/transfer"
 import { Instructions } from "@opencode/core/instructions/index"
 import { InstructionBuiltIns } from "@opencode/core/instructions/builtins"
 import { InstructionDiscovery } from "@opencode/core/instruction-discovery"
@@ -482,6 +483,7 @@ const layer = Layer.unwrap(
         SessionRunnerLLM.node,
         SessionExecution.node,
         Session.node,
+        SessionTransfer.node,
       ]),
       [
         ...replacements,
@@ -3918,6 +3920,107 @@ describe("SessionRunnerLLM", () => {
       yield* replaySessionProjection(sessionID)
       expect(requireAssistant(yield* s.context)).toEqual(assistant)
     })
+
+  scenario("terminalizes a new assistant when a stale hosted result defects after input delivery", function* (s) {
+    const transfer = yield* SessionTransfer.Service
+    s.currentModel = LanguageModel.make({
+      id: "claude-opus-5",
+      provider: "anthropic",
+      route: AnthropicMessages.route,
+    })
+    yield* s.bus.publish(SessionEvent.ModelSelected, {
+      sessionID,
+      model: { id: ID.make("claude-opus-5"), providerID: Provider.ID.anthropic },
+    })
+    yield* s.llm.push(TestLLM.text("Stable baseline", "baseline"))
+    yield* s.runPrompt("Baseline")
+    const baseline = yield* transfer.export({ sessionID })
+    yield* s.llm.push(
+      Stream.concat(
+        Stream.fromIterable([
+          LLMEvent.stepStart({ index: 0 }),
+          hostedCall("stale-search", "Effect"),
+          LLMEvent.toolCall({ id: "echo-first", name: "echo", input: { text: "first" } }),
+          LLMEvent.stepFinish({ index: 0, reason: { normalized: "tool-calls", raw: "tool_use" } }),
+        ]),
+        Stream.fromEffect(s.admit("Interleaved user").pipe(Effect.orDie)).pipe(Stream.drain),
+      ),
+      [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolResult({
+          id: "stale-search",
+          name: "web_search",
+          providerExecuted: true,
+          result: { type: "json", value: [] },
+          providerMetadata: { anthropic: { blockType: "web_search_tool_result", result: [] } },
+        }),
+      ],
+    )
+    yield* s.admit("Search and echo")
+    expect(Exit.isFailure(yield* s.resume.pipe(Effect.exit))).toBe(true)
+    expect(s.executions).toEqual(["first"])
+    const context = yield* s.context
+    const failed = context.findLast((message) => message.type === "assistant")!
+    expect(failed).toMatchObject({
+      type: "assistant",
+      content: [],
+      error: { type: "unknown", message: "Tool result before call: stale-search" },
+    })
+    expect(failed.time.completed).toBeDefined()
+    const owner = context.find(
+      (message) =>
+        message.type === "assistant" &&
+        message.content.some((part) => part.type === "tool" && part.id === "stale-search"),
+    )!
+    expect(owner).toMatchObject({
+      content: [
+        { id: "stale-search", state: { status: "error", error: { type: "aborted" } } },
+        { id: "echo-first", state: { status: "completed" } },
+      ],
+    })
+    const events = yield* recordedStepSettlementEvents(sessionID, owner.id)
+    expect(events.filter((event) => event.data.id === "stale-search").map((event) => event.type)).toEqual([
+      "session.tool.called.1",
+      "session.tool.failed.2",
+    ])
+    const terminal = yield* recordedStepSettlementEvents(sessionID, failed.id)
+    expect(terminal.filter((event) => event.type === "session.step.failed.1")).toHaveLength(1)
+    const exported = yield* transfer.export({ sessionID })
+    expect(exported.messages.slice(0, baseline.messages.length)).toEqual([...baseline.messages])
+    // This fixture seeds the Session row without a Created event. Restore its
+    // original model before replaying the ModelSelected event as the boundary fixture does.
+    yield* s.db.update(SessionTable).set({ model: null }).where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+    yield* replaySessionProjection(sessionID)
+    expect((yield* transfer.export({ sessionID })).messages).toEqual(exported.messages)
+  })
+
+  scenario("settles current hosted tools when a non-AI stream defect terminates the step", function* (s) {
+    const transfer = yield* SessionTransfer.Service
+    yield* s.admit("Read a malformed provider stream")
+    yield* s.llm.push(
+      Stream.concat(
+        Stream.fromIterable([LLMEvent.stepStart({ index: 0 }), hostedCall("pending-at-defect", "Effect")]),
+        Stream.fromEffect(Effect.die(new Error("decoder defect"))),
+      ),
+    )
+    expect(Exit.isFailure(yield* s.resume.pipe(Effect.exit))).toBe(true)
+    expect(s.requests).toHaveLength(1)
+    const assistant = requireAssistant(yield* s.context)
+    expect(assistant).toMatchObject({
+      error: { type: "unknown", message: "decoder defect" },
+      content: [{ id: "pending-at-defect", state: { status: "error", error: { type: "unknown" } } }],
+    })
+    expect(assistant.time.completed).toBeDefined()
+    const events = yield* recordedStepSettlementEvents(sessionID, assistant.id)
+    expect(events.filter((event) => event.data.id === "pending-at-defect").map((event) => event.type)).toEqual([
+      "session.tool.called.1",
+      "session.tool.failed.2",
+    ])
+    expect(events.filter((event) => event.type === "session.step.failed.1")).toHaveLength(1)
+    const exported = yield* transfer.export({ sessionID })
+    yield* replaySessionProjection(sessionID)
+    expect((yield* transfer.export({ sessionID })).messages).toEqual(exported.messages)
+  })
 
   for (const boundary of ["cancellation", "preparation failure", "provider change"] as const)
     scenario(`settles deferred Anthropic tools after ${boundary}`, function* (s) {
