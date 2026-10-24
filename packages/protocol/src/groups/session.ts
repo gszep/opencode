@@ -258,12 +258,13 @@ export const makeSessionGroup = <
         params: { sessionID: Session.ID },
         query: Schema.Struct({ sanitize: BooleanFromString.pipe(Schema.optional) }),
         success: Schema.Struct({ data: PublicSessionTransfer }),
-        error: [SessionNotFoundError, UnknownError],
+        error: [SessionNotFoundError, ConflictError, UnknownError],
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "experimental.session.export",
           summary: "Export session",
-          description: "Export a complete projected session transcript.",
+          description:
+            "Export a complete settled projected session transcript. Returns 409 while any message or tool remains unsettled; retry after completion.",
         }),
       ),
     )
