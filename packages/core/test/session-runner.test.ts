@@ -66,6 +66,7 @@ import type { Info as ToolInfo } from "@opencode/schema/tool"
 import { InstructionStateTable, SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { InstructionEntry } from "@opencode/core/session/instruction-entry"
 import { SessionStore } from "@opencode/core/session/store"
+import { SessionTransfer } from "@opencode/core/session/transfer"
 import { Instructions } from "@opencode/core/instructions/index"
 import { InstructionBuiltIns } from "@opencode/core/instructions/builtins"
 import { InstructionDiscovery } from "@opencode/core/instruction-discovery"
@@ -270,232 +271,239 @@ const transformTools = (registry: Tool.Interface, tools: Readonly<Record<string,
   registry.transform((editor) =>
     Object.entries(tools).forEach(([name, tool]) => editor.add({ ...tool, name, options: options ?? tool.options })),
   )
-const layer = Layer.unwrap(
-  Effect.map(RunnerState, (state) => {
-    const modelTransport = Layer.succeed(
-      SessionModelTransport.Service,
-      SessionModelTransport.Service.of({
-        bind: () => ({ execute: () => Effect.die("Unexpected WebSocket execution") }),
-        close: (sessionID) => Effect.sync(() => state.closedTransports.push(sessionID)),
-        closeAll: Effect.void,
-      }),
-    )
-    const echo = Layer.effectDiscard(
-      Tool.Service.use((registry) =>
-        transformTools(
-          registry,
-          {
-            echo: {
-              name: "echo",
-              description: "Echo text",
-              input: Schema.Struct({ text: Schema.String }),
-              output: Schema.Struct({ text: Schema.String }),
-              execute: ({ text }, context) =>
-                Effect.gen(function* () {
-                  state.authorizations.push(context)
-                  state.executions.push(text)
-                  yield* state.awaitToolBarrier
-                  return { output: { text }, content: text }
-                }),
+// Keep the ordinary coordinator fixture unchanged; only export scenarios add
+// the real transfer service and its dependency graph.
+const makeLayer = <A>(extra: LayerNode.Graph<A>) =>
+  Layer.unwrap(
+    Effect.map(RunnerState, (state) => {
+      const modelTransport = Layer.succeed(
+        SessionModelTransport.Service,
+        SessionModelTransport.Service.of({
+          bind: () => ({ execute: () => Effect.die("Unexpected WebSocket execution") }),
+          close: (sessionID) => Effect.sync(() => state.closedTransports.push(sessionID)),
+          closeAll: Effect.void,
+        }),
+      )
+      const echo = Layer.effectDiscard(
+        Tool.Service.use((registry) =>
+          transformTools(
+            registry,
+            {
+              echo: {
+                name: "echo",
+                description: "Echo text",
+                input: Schema.Struct({ text: Schema.String }),
+                output: Schema.Struct({ text: Schema.String }),
+                execute: ({ text }, context) =>
+                  Effect.gen(function* () {
+                    state.authorizations.push(context)
+                    state.executions.push(text)
+                    yield* state.awaitToolBarrier
+                    return { output: { text }, content: text }
+                  }),
+              },
+              defect: {
+                name: "defect",
+                description: "Fail unexpectedly",
+                input: Schema.Struct({}),
+                output: Schema.Struct({}),
+                execute: () => state.awaitToolBarrier.pipe(Effect.andThen(Effect.die("unexpected tool defect"))),
+              },
+              storefail: {
+                name: "storefail",
+                description: "Produce output that cannot be persisted",
+                input: Schema.Struct({}),
+                output: Schema.Struct({}),
+                execute: () => Effect.succeed({ output: {} }),
+              },
             },
-            defect: {
-              name: "defect",
-              description: "Fail unexpectedly",
-              input: Schema.Struct({}),
-              output: Schema.Struct({}),
-              execute: () => state.awaitToolBarrier.pipe(Effect.andThen(Effect.die("unexpected tool defect"))),
-            },
-            storefail: {
-              name: "storefail",
-              description: "Produce output that cannot be persisted",
-              input: Schema.Struct({}),
-              output: Schema.Struct({}),
-              execute: () => Effect.succeed({ output: {} }),
-            },
-          },
-          { codemode: false },
+            { codemode: false },
+          ),
         ),
-      ),
-    )
-    const echoNode = makeLocationNode({ name: "test/session-runner-tools", layer: echo, deps: [Tool.node] })
-    const models = Layer.mock(SessionRunnerModel.Service)({
-      resolve: (session) =>
-        state.modelResolveHook.pipe(
-          Effect.map(() => {
-            const selected = session.model?.id === "replacement" ? replacementModel : state.currentModel
-            return SessionRunnerModel.resolved(selected, {
-              capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
-              cost: [],
-              limit: modelLimits.get(String(selected.id)) ?? defaultModelLimit,
-              variant: session.model?.variant,
-              compaction: state.compaction,
-            })
-          }),
-        ),
-    })
-    const systemContextKey = Instructions.Key.make("test/context")
-    const systemContext = Layer.mock(InstructionBuiltIns.Service, {
-      load: () =>
-        Effect.sync(() =>
-          Instructions.make({
-            key: systemContextKey,
-            codec: Schema.toCodecJson(Schema.String),
-            read: state.systemLoadHook.pipe(
-              Effect.andThen(
-                Effect.sync(() =>
-                  state.systemUnavailable
-                    ? Instructions.unavailable
-                    : state.systemRemoved
-                      ? Instructions.removed
-                      : state.systemBaseline,
+      )
+      const echoNode = makeLocationNode({ name: "test/session-runner-tools", layer: echo, deps: [Tool.node] })
+      const models = Layer.mock(SessionRunnerModel.Service)({
+        resolve: (session) =>
+          state.modelResolveHook.pipe(
+            Effect.map(() => {
+              const selected = session.model?.id === "replacement" ? replacementModel : state.currentModel
+              return SessionRunnerModel.resolved(selected, {
+                capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+                cost: [],
+                limit: modelLimits.get(String(selected.id)) ?? defaultModelLimit,
+                variant: session.model?.variant,
+                compaction: state.compaction,
+              })
+            }),
+          ),
+      })
+      const systemContextKey = Instructions.Key.make("test/context")
+      const systemContext = Layer.mock(InstructionBuiltIns.Service, {
+        load: () =>
+          Effect.sync(() =>
+            Instructions.make({
+              key: systemContextKey,
+              codec: Schema.toCodecJson(Schema.String),
+              read: state.systemLoadHook.pipe(
+                Effect.andThen(
+                  Effect.sync(() =>
+                    state.systemUnavailable
+                      ? Instructions.unavailable
+                      : state.systemRemoved
+                        ? Instructions.removed
+                        : state.systemBaseline,
+                  ),
                 ),
               ),
-            ),
-            render: {
-              initial: String,
-              changed: (_previous, current) => current,
-              removed: () => "System context source removed: test/context",
-            },
-          }),
-        ),
-    })
-    const instructionContext = Layer.mock(InstructionDiscovery.Service, {
-      project: true,
-      global: true,
-      load: () => Effect.succeed(Instructions.empty),
-    })
-    const skillInstructions = Layer.mock(SkillInstructions.Service, {
-      load: (permissions) => {
-        // `setup` tags each agent's ruleset with a `skill` rule naming that agent.
-        const baseline = permissions
-          .filter((rule) => rule.action === "skill")
-          .map((rule) => state.skillBaselines.get(Agent.ID.make(rule.resource)))
-          .findLast((text) => text !== undefined)
-        return Effect.succeed(
-          baseline === undefined
-            ? Instructions.empty
-            : Instructions.make({
-                key: Instructions.Key.make("test/skill-guidance"),
-                codec: Schema.toCodecJson(Schema.String),
-                read: Effect.succeed(baseline),
-                render: {
-                  initial: String,
-                  changed: (_previous, current) => current,
-                  removed: () => "Skill guidance removed",
-                },
-              }),
-        )
-      },
-    })
-    const referenceInstructions = Layer.mock(ReferenceInstructions.Service, {
-      load: () => Effect.succeed(Instructions.empty),
-    })
-    const mcpInstructions = Layer.mock(McpInstructions.Service, { load: () => Effect.succeed(Instructions.empty) })
-    const config = Config.testLayer([
-      new Document({
-        type: "document",
-        info: new Info({
-          compaction: new ConfigCompaction.Info({
-            buffer: 3_000,
-            keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
+              render: {
+                initial: String,
+                changed: (_previous, current) => current,
+                removed: () => "System context source removed: test/context",
+              },
+            }),
+          ),
+      })
+      const instructionContext = Layer.mock(InstructionDiscovery.Service, {
+        project: true,
+        global: true,
+        load: () => Effect.succeed(Instructions.empty),
+      })
+      const skillInstructions = Layer.mock(SkillInstructions.Service, {
+        load: (permissions) => {
+          // `setup` tags each agent's ruleset with a `skill` rule naming that agent.
+          const baseline = permissions
+            .filter((rule) => rule.action === "skill")
+            .map((rule) => state.skillBaselines.get(Agent.ID.make(rule.resource)))
+            .findLast((text) => text !== undefined)
+          return Effect.succeed(
+            baseline === undefined
+              ? Instructions.empty
+              : Instructions.make({
+                  key: Instructions.Key.make("test/skill-guidance"),
+                  codec: Schema.toCodecJson(Schema.String),
+                  read: Effect.succeed(baseline),
+                  render: {
+                    initial: String,
+                    changed: (_previous, current) => current,
+                    removed: () => "Skill guidance removed",
+                  },
+                }),
+          )
+        },
+      })
+      const referenceInstructions = Layer.mock(ReferenceInstructions.Service, {
+        load: () => Effect.succeed(Instructions.empty),
+      })
+      const mcpInstructions = Layer.mock(McpInstructions.Service, { load: () => Effect.succeed(Instructions.empty) })
+      const config = Config.testLayer([
+        new Document({
+          type: "document",
+          info: new Info({
+            compaction: new ConfigCompaction.Info({
+              buffer: 3_000,
+              keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
+            }),
           }),
         }),
-      }),
-    ])
-    const promptModels = Layer.mock(Model.Service, {
-      get: () => Effect.undefined,
-      all: () => Effect.succeed([]),
-      available: () => Effect.succeed([]),
-      default: () => Effect.undefined,
-      small: () => Effect.undefined,
-    })
-    const replacements: LayerNode.Replacements = [
-      Snapshot.node.replace(Snapshot.noopLayer),
-      LayerNodePlatform.llmClient.replace(TestLLM.clientLayer.pipe(Layer.provide(testLLM))),
-      SessionRunnerModel.node.replace(models),
-      InstructionBuiltIns.node.replace(systemContext),
-      InstructionDiscovery.node.replace(instructionContext),
-      Location.node.replace(Location.boundNode({ directory: AbsolutePath.make("/project") })),
-      SkillInstructions.node.replace(skillInstructions),
-      ReferenceInstructions.node.replace(referenceInstructions),
-      Permission.node.replace(permission),
-      Config.node.replace(config),
-      PluginSupervisor.node.replace(Layer.empty),
-      Plugin.node.replace(Layer.mock(Plugin.Service, { awaitActivation: Effect.void })),
-      SessionModelTransport.node.replace(modelTransport),
-    ]
-    const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
-      ...replacements,
-      McpInstructions.node.replace(mcpInstructions),
-    ])
-    const execution = Layer.effect(
-      SessionExecution.Service,
-      Effect.gen(function* () {
-        const sessionRunner = yield* SessionRunner.Service
-        function drain(
-          sessionID: Session.ID,
-          force: boolean,
-          continuation?: SessionRunner.Continuation,
-        ): Effect.Effect<void, SessionRunner.RunError> {
-          return sessionRunner
-            .drain({ sessionID, force, continuation })
-            .pipe(
-              Effect.flatMap((result) =>
-                result._tag === "Complete" ? Effect.void : drain(sessionID, false, result.continuation),
-              ),
-            )
-        }
-        const coordinator = yield* SessionRunCoordinator.make<Session.ID, SessionRunner.RunError>({
-          drain: (sessionID, force) => drain(sessionID, force),
-        })
-        return SessionExecution.Service.of({
-          active: coordinator.active,
-          isActive: coordinator.isActive,
-          resume: coordinator.run,
-          wake: coordinator.wake,
-          interrupt: (sessionID) => coordinator.interrupt(sessionID),
-          awaitIdle: coordinator.awaitIdle,
-        })
-      }),
-    ).pipe(Layer.provide(runnerLayer), Layer.orDie)
-    return AppNodeBuilder.build(
-      LayerNode.group([
-        Database.node,
-        Bus.node,
-        Form.node,
-        SessionProjector.node,
-        SessionStore.node,
-        SessionInbox.node,
-        Agent.node,
-        Model.node,
-        Tool.node,
-        PluginHooks.node,
-        echoNode,
-        SessionRunnerModel.node,
-        InstructionBuiltIns.node,
-        InstructionDiscovery.node,
-        InstructionEntry.node,
-        SkillInstructions.node,
-        ReferenceInstructions.node,
-        Config.node,
-        Snapshot.node,
-        SessionCompaction.node,
-        LayerNodePlatform.llmClient,
-        SessionRunnerLLM.node,
-        SessionExecution.node,
-        Session.node,
-      ]),
-      [
+      ])
+      const promptModels = Layer.mock(Model.Service, {
+        get: () => Effect.undefined,
+        all: () => Effect.succeed([]),
+        available: () => Effect.succeed([]),
+        default: () => Effect.undefined,
+        small: () => Effect.undefined,
+      })
+      const replacements: LayerNode.Replacements = [
+        Snapshot.node.replace(Snapshot.noopLayer),
+        LayerNodePlatform.llmClient.replace(TestLLM.clientLayer.pipe(Layer.provide(testLLM))),
+        SessionRunnerModel.node.replace(models),
+        InstructionBuiltIns.node.replace(systemContext),
+        InstructionDiscovery.node.replace(instructionContext),
+        Location.node.replace(Location.boundNode({ directory: AbsolutePath.make("/project") })),
+        SkillInstructions.node.replace(skillInstructions),
+        ReferenceInstructions.node.replace(referenceInstructions),
+        Permission.node.replace(permission),
+        Config.node.replace(config),
+        PluginSupervisor.node.replace(Layer.empty),
+        Plugin.node.replace(Layer.mock(Plugin.Service, { awaitActivation: Effect.void })),
+        SessionModelTransport.node.replace(modelTransport),
+      ]
+      const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
         ...replacements,
-        Bus.node.replace(Bus.configured({ persist: true })),
-        LocationServiceMap.node.replace(promptLocationNode),
-        Model.node.replace(promptModels),
-        SessionExecution.node.replace(execution),
-      ],
-    )
-  }),
-).pipe(Layer.provideMerge(Layer.sync(RunnerState, makeRunnerState)), Layer.provideMerge(testLLM))
+        McpInstructions.node.replace(mcpInstructions),
+      ])
+      const execution = Layer.effect(
+        SessionExecution.Service,
+        Effect.gen(function* () {
+          const sessionRunner = yield* SessionRunner.Service
+          function drain(
+            sessionID: Session.ID,
+            force: boolean,
+            continuation?: SessionRunner.Continuation,
+          ): Effect.Effect<void, SessionRunner.RunError> {
+            return sessionRunner
+              .drain({ sessionID, force, continuation })
+              .pipe(
+                Effect.flatMap((result) =>
+                  result._tag === "Complete" ? Effect.void : drain(sessionID, false, result.continuation),
+                ),
+              )
+          }
+          const coordinator = yield* SessionRunCoordinator.make<Session.ID, SessionRunner.RunError>({
+            drain: (sessionID, force) => drain(sessionID, force),
+          })
+          return SessionExecution.Service.of({
+            active: coordinator.active,
+            isActive: coordinator.isActive,
+            resume: coordinator.run,
+            wake: coordinator.wake,
+            interrupt: (sessionID) => coordinator.interrupt(sessionID),
+            awaitIdle: coordinator.awaitIdle,
+          })
+        }),
+      ).pipe(Layer.provide(runnerLayer), Layer.orDie)
+      return AppNodeBuilder.build(
+        LayerNode.group([
+          Database.node,
+          Bus.node,
+          Form.node,
+          SessionProjector.node,
+          SessionStore.node,
+          SessionInbox.node,
+          Agent.node,
+          Model.node,
+          Tool.node,
+          PluginHooks.node,
+          echoNode,
+          SessionRunnerModel.node,
+          InstructionBuiltIns.node,
+          InstructionDiscovery.node,
+          InstructionEntry.node,
+          SkillInstructions.node,
+          ReferenceInstructions.node,
+          Config.node,
+          Snapshot.node,
+          SessionCompaction.node,
+          LayerNodePlatform.llmClient,
+          SessionRunnerLLM.node,
+          SessionExecution.node,
+          Session.node,
+          extra,
+        ]),
+        [
+          ...replacements,
+          Bus.node.replace(Bus.configured({ persist: true })),
+          LocationServiceMap.node.replace(promptLocationNode),
+          Model.node.replace(promptModels),
+          SessionExecution.node.replace(execution),
+        ],
+      )
+    }),
+  ).pipe(Layer.provideMerge(Layer.sync(RunnerState, makeRunnerState)), Layer.provideMerge(testLLM))
+const layer = makeLayer(LayerNode.group([]))
+const transferLayer = makeLayer(SessionTransfer.node)
 const it = testEffect(layer)
+const itWithTransfer = testEffect(transferLayer)
 const sessionID = Session.ID.make("ses_runner_test")
 const otherSessionID = Session.ID.make("ses_runner_other")
 
@@ -590,6 +598,18 @@ const scenario = (
   body: (s: Scenario) => Effect.gen.Return<void, unknown, Layer.Success<typeof layer> | Scope.Scope>,
 ) =>
   it.effect(
+    name,
+    Effect.gen(function* () {
+      const s = yield* setup
+      return yield* body(s)
+    }),
+  )
+
+const transferScenario = (
+  name: string,
+  body: (s: Scenario) => Effect.gen.Return<void, unknown, Layer.Success<typeof transferLayer> | Scope.Scope>,
+) =>
+  itWithTransfer.effect(
     name,
     Effect.gen(function* () {
       const s = yield* setup
@@ -4166,6 +4186,115 @@ describe("SessionRunnerLLM", () => {
       yield* replaySessionProjection(sessionID)
       expect(requireAssistant(yield* s.context)).toEqual(assistant)
     })
+
+  transferScenario(
+    "terminalizes a new assistant when a stale hosted result defects after input delivery",
+    function* (s) {
+      const transfer = yield* SessionTransfer.Service
+      s.currentModel = LanguageModel.make({
+        id: "claude-opus-5",
+        provider: "anthropic",
+        route: AnthropicMessages.route,
+      })
+      yield* s.bus.publish(SessionEvent.ModelSelected, {
+        sessionID,
+        model: { id: ID.make("claude-opus-5"), providerID: Provider.ID.anthropic },
+      })
+      yield* s.llm.push(TestLLM.text("Stable baseline", "baseline"))
+      yield* s.runPrompt("Baseline")
+      const baseline = yield* transfer.export({ sessionID })
+      yield* s.llm.push(
+        Stream.concat(
+          Stream.fromIterable([
+            LLMEvent.stepStart({ index: 0 }),
+            hostedCall("stale-search", "Effect"),
+            LLMEvent.toolCall({ id: "echo-first", name: "echo", input: { text: "first" } }),
+            LLMEvent.stepFinish({ index: 0, reason: { normalized: "tool-calls", raw: "tool_use" } }),
+          ]),
+          Stream.fromEffect(s.admit("Interleaved user").pipe(Effect.orDie)).pipe(Stream.drain),
+        ),
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolResult({
+            id: "stale-search",
+            name: "web_search",
+            providerExecuted: true,
+            result: { type: "json", value: [] },
+            providerMetadata: { anthropic: { blockType: "web_search_tool_result", result: [] } },
+          }),
+        ],
+      )
+      yield* s.admit("Search and echo")
+      expect(Exit.isFailure(yield* s.resume.pipe(Effect.exit))).toBe(true)
+      expect(s.executions).toEqual(["first"])
+      const context = yield* s.context
+      const failed = context.findLast((message) => message.type === "assistant")!
+      expect(failed).toMatchObject({
+        type: "assistant",
+        content: [],
+        error: { type: "unknown", message: "Tool result before call: stale-search" },
+      })
+      expect(failed.time.completed).toBeDefined()
+      const owner = context.find(
+        (message) =>
+          message.type === "assistant" &&
+          message.content.some((part) => part.type === "tool" && part.id === "stale-search"),
+      )!
+      expect(owner).toMatchObject({
+        content: [
+          { id: "stale-search", state: { status: "error", error: { type: "aborted" } } },
+          { id: "echo-first", state: { status: "completed" } },
+        ],
+      })
+      const events = yield* recordedStepSettlementEvents(sessionID, owner.id)
+      expect(events.filter((event) => event.data.id === "stale-search").map((event) => event.type)).toEqual([
+        "session.tool.called.1",
+        "session.tool.failed.2",
+      ])
+      const terminal = yield* recordedStepSettlementEvents(sessionID, failed.id)
+      expect(terminal.filter((event) => event.type === "session.step.failed.1")).toHaveLength(1)
+      const exported = yield* transfer.export({ sessionID })
+      expect(exported.messages.slice(0, baseline.messages.length)).toEqual([...baseline.messages])
+      // This fixture seeds the Session row without a Created event. Restore its
+      // original model before replaying the ModelSelected event as the boundary fixture does.
+      yield* s.db
+        .update(SessionTable)
+        .set({ model: null })
+        .where(eq(SessionTable.id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+      yield* replaySessionProjection(sessionID)
+      expect((yield* transfer.export({ sessionID })).messages).toEqual(exported.messages)
+    },
+  )
+
+  transferScenario("settles current hosted tools when a non-AI stream defect terminates the step", function* (s) {
+    const transfer = yield* SessionTransfer.Service
+    yield* s.admit("Read a malformed provider stream")
+    yield* s.llm.push(
+      Stream.concat(
+        Stream.fromIterable([LLMEvent.stepStart({ index: 0 }), hostedCall("pending-at-defect", "Effect")]),
+        Stream.fromEffect(Effect.die(new Error("decoder defect"))),
+      ),
+    )
+    expect(Exit.isFailure(yield* s.resume.pipe(Effect.exit))).toBe(true)
+    expect(s.requests).toHaveLength(1)
+    const assistant = requireAssistant(yield* s.context)
+    expect(assistant).toMatchObject({
+      error: { type: "unknown", message: "decoder defect" },
+      content: [{ id: "pending-at-defect", state: { status: "error", error: { type: "unknown" } } }],
+    })
+    expect(assistant.time.completed).toBeDefined()
+    const events = yield* recordedStepSettlementEvents(sessionID, assistant.id)
+    expect(events.filter((event) => event.data.id === "pending-at-defect").map((event) => event.type)).toEqual([
+      "session.tool.called.1",
+      "session.tool.failed.2",
+    ])
+    expect(events.filter((event) => event.type === "session.step.failed.1")).toHaveLength(1)
+    const exported = yield* transfer.export({ sessionID })
+    yield* replaySessionProjection(sessionID)
+    expect((yield* transfer.export({ sessionID })).messages).toEqual(exported.messages)
+  })
 
   for (const boundary of ["cancellation", "preparation failure", "provider change"] as const)
     scenario(`settles deferred Anthropic tools after ${boundary}`, function* (s) {

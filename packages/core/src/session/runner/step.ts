@@ -197,6 +197,14 @@ export const make = Effect.gen(function* () {
           return Outcome.Retry({ error: llmError, decision: retry })
         }
         if (llmError) yield* publisher.failAssistant(llmError)
+        // Protocol/publisher defects are not AIError, but a failed stream must
+        // still settle its projection before the original cause is rethrown.
+        // Otherwise even an empty started assistant blocks settled exports.
+        if (Exit.isFailure(stream) && !Cause.hasInterrupts(stream.cause) && !llmFailure && !recorded.providerFailed) {
+          const error = toSessionError(Cause.squash(stream.cause))
+          yield* publisher.failUnsettledTools(error)
+          yield* publisher.failAssistant(error)
+        }
 
         for (const decline of tools.declines)
           yield* publisher.failTool(decline.call.id, {
