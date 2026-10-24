@@ -226,8 +226,13 @@ const GeminiUsage = Schema.Struct({
 type GeminiUsage = Schema.Schema.Type<typeof GeminiUsage>
 
 const GeminiCandidate = Schema.Struct({
+  index: optionalNull(Schema.Number),
   content: optionalNull(GeminiResponseContent),
   finishReason: optionalNull(Schema.String),
+  // Keep provider grounding intact: support indices address this exact chunk array,
+  // and support text describes the answer, not the contents of the cited page.
+  groundingMetadata: optionalNull(JsonObject),
+  citationMetadata: optionalNull(JsonObject),
 })
 
 const GeminiPromptFeedback = Schema.StructWithRest(
@@ -263,6 +268,9 @@ interface ParserState {
   readonly nextReasoningId: number
   readonly nextTextId: number
   readonly seenCallIds?: ReadonlySet<string>
+  readonly candidateIndex?: number
+  readonly groundingMetadata?: Record<string, unknown>
+  readonly citationMetadata?: Record<string, unknown>
 }
 
 // =============================================================================
@@ -548,6 +556,10 @@ const finish = (state: ParserState): ReadonlyArray<LLMEvent> => {
   if (finishReason === undefined && state.usage === undefined) return []
 
   const events: LLMEvent[] = []
+  const metadata = {
+    ...(state.groundingMetadata === undefined ? {} : { groundingMetadata: state.groundingMetadata }),
+    ...(state.citationMetadata === undefined ? {} : { citationMetadata: state.citationMetadata }),
+  }
   let lifecycle = state.lifecycle
   if (state.reasoningId !== undefined)
     lifecycle = Lifecycle.reasoningEnd(
@@ -563,9 +575,12 @@ const finish = (state: ParserState): ReadonlyArray<LLMEvent> => {
       lifecycle,
       events,
       state.textId,
-      state.textSignature === undefined
+      state.textSignature === undefined && Object.keys(metadata).length === 0
         ? undefined
-        : providerMetadata(state.providerMetadataKey, { thoughtSignature: state.textSignature }),
+        : providerMetadata(state.providerMetadataKey, {
+            ...metadata,
+            ...(state.textSignature === undefined ? {} : { thoughtSignature: state.textSignature }),
+          }),
     )
   Lifecycle.finish(lifecycle, events, {
     reason: {
@@ -575,9 +590,12 @@ const finish = (state: ParserState): ReadonlyArray<LLMEvent> => {
     },
     usage: state.usage,
     providerMetadata:
-      state.promptFeedback === undefined
+      state.promptFeedback === undefined && Object.keys(metadata).length === 0
         ? undefined
-        : providerMetadata(state.providerMetadataKey, { promptFeedback: state.promptFeedback }),
+        : providerMetadata(state.providerMetadataKey, {
+            ...metadata,
+            ...(state.promptFeedback === undefined ? {} : { promptFeedback: state.promptFeedback }),
+          }),
   })
   return events
 }
@@ -604,14 +622,34 @@ const step = (state: ParserState, event: GeminiEvent) => {
     return Effect.fail(
       ProviderShared.eventError(state.route, `Invalid ${state.route} stream event`, ProviderShared.encodeJson(event)),
     )
+  // Select one candidate for this response, then follow its index even if later
+  // frames reorder or omit it. Never combine another candidate's sources/text.
+  const candidates = event.candidates ?? []
+  const selected =
+    state.candidateIndex === undefined
+      ? candidates.findIndex((candidate) => (candidate.content?.parts?.length ?? 0) > 0)
+      : candidates.findIndex((candidate, index) => (candidate.index ?? index) === state.candidateIndex)
+  const position =
+    state.candidateIndex === undefined && selected === -1
+      ? candidates.findIndex(
+          (candidate) => candidate.finishReason || candidate.groundingMetadata || candidate.citationMetadata,
+        )
+      : selected
+  const candidate = candidates[position]
   const nextState = {
     ...state,
+    candidateIndex: state.candidateIndex ?? (candidate ? (candidate.index ?? position) : undefined),
+    groundingMetadata: candidate?.groundingMetadata
+      ? { ...state.groundingMetadata, ...candidate.groundingMetadata }
+      : state.groundingMetadata,
+    citationMetadata: candidate?.citationMetadata
+      ? { ...state.citationMetadata, ...candidate.citationMetadata }
+      : state.citationMetadata,
     promptFeedback: event.promptFeedback ?? state.promptFeedback,
     usage: event.usageMetadata
       ? (mapUsage(event.usageMetadata, state.providerMetadataKey) ?? state.usage)
       : state.usage,
   }
-  const candidate = event.candidates?.[0]
   if (candidate?.finishReason && mapFinishReason(candidate.finishReason, state.hasToolCalls) === "error")
     return Effect.fail(
       ProviderShared.eventError(

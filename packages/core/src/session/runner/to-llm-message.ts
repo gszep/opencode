@@ -178,6 +178,15 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
         : item.text.length > 0
           ? [{ type: message.error === undefined ? "reasoning" : "text", text: item.text }]
           : []
+    // Synthetic failures have no native server-result payload. Do not fabricate
+    // an Anthropic web_search_tool_result from a core error object.
+    if (
+      item.executed === true &&
+      item.state.status === "error" &&
+      item.providerResultState === undefined &&
+      providerMetadataKey === "anthropic"
+    )
+      return [{ type: "text", text: `${item.name}: ${item.state.error.message}` }]
     // Call-side metadata is model-scoped proof of generation (Gemini thought
     // signatures, OpenAI encrypted reasoning): only the producing model may
     // replay it.
