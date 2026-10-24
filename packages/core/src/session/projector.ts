@@ -191,7 +191,14 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
           gt(SessionMessageTable.seq, cursor),
           lt(SessionMessageTable.seq, copiedSeq + 1),
           // Terminal events for active projections stay on the parent, so forks copy only settled history.
-          sql`${SessionMessageTable.type} != 'assistant' or json_extract(${SessionMessageTable.data}, '$.time.completed') is not null`,
+          sql`${SessionMessageTable.type} != 'assistant' or (
+            json_extract(${SessionMessageTable.data}, '$.time.completed') is not null
+            and not exists (
+              select 1 from json_each(${SessionMessageTable.data}, '$.content') as part
+              where json_extract(part.value, '$.type') = 'tool'
+                and json_extract(part.value, '$.state.status') in ('streaming', 'running')
+            )
+          )`,
           sql`${SessionMessageTable.type} != 'shell' or json_extract(${SessionMessageTable.data}, '$.status') != 'running'`,
           sql`${SessionMessageTable.type} != 'compaction' or json_extract(${SessionMessageTable.data}, '$.status') != 'running'`,
         ),

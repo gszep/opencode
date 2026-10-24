@@ -85,11 +85,13 @@ const layer = Layer.effect(
                     sessionID,
                     entering || !continuing ? "input" : "steer",
                   )
-                  if (next?.type === "compaction")
+                  if (next?.type === "compaction") {
+                    yield* settleStaleToolCalls(sessionID, true)
                     yield* bus.publishAll([
                       [SessionEvent.InboxDelivered, { sessionID, inboxID: next.id }],
                       [SessionEvent.Compaction.Started, { sessionID, reason: "manual", recent: "", inputID: next.id }],
                     ])
+                  }
                   if (next?.type === "move")
                     yield* restore(
                       Effect.gen(function* () {
@@ -214,13 +216,58 @@ const layer = Layer.effect(
         // Reuse boundary preparation once; retries refresh context without delivering more input.
         const loaded = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
         initial = undefined
-        const compacted = yield* compaction.compact({ reason: "auto", context: loaded })
-        if (compacted.status === "failed") return yield* new StepFailedError({ error: compacted.error })
-        if (compacted.status === "completed") {
-          assistantMessageID = SessionMessage.ID.create()
+        const stepLimitReached = loaded.agent.info.steps !== undefined && step >= loaded.agent.info.steps
+        // A pre-output retry can already have an empty assistant for this logical step.
+        const previous = loaded.messages.findLast(
+          (message) => message.type === "assistant" && message.id !== assistantMessageID,
+        )
+        const pendingTools = loaded.messages.flatMap((message) =>
+          message.type !== "assistant"
+            ? []
+            : message.content.flatMap((tool) =>
+                tool.type === "tool" && tool.executed === true && tool.state.status === "running"
+                  ? [{ id: tool.id, name: tool.name, assistantMessageID: message.id }]
+                  : [],
+              ),
+        )
+        if (
+          pendingTools.length > 0 &&
+          (stepLimitReached ||
+            loaded.model.model.route.protocol !== "anthropic-messages" ||
+            previous?.type !== "assistant" ||
+            previous.error !== undefined ||
+            previous.finish !== "tool-calls" ||
+            previous.rawFinish !== "tool_use" ||
+            !previous.content.some(
+              (tool) =>
+                tool.type === "tool" &&
+                tool.executed !== true &&
+                (tool.state.status === "completed" || tool.state.status === "error"),
+            ) ||
+            previous.model.providerID !== loaded.model.ref.providerID ||
+            previous.model.id !== loaded.model.ref.id ||
+            // Deferred execution requires the immediate client-result continuation,
+            // without newly admitted input or instruction updates after its owner.
+            loaded.messages
+              .slice(loaded.messages.indexOf(previous) + 1)
+              .some(
+                (message) =>
+                  message.type !== "assistant" || message.id !== assistantMessageID || message.content.length > 0,
+              ) ||
+            pendingTools.some((tool) => tool.assistantMessageID !== previous.id))
+        ) {
+          yield* settleStaleToolCalls(sessionID)
           continue
         }
-        const stepLimitReached = loaded.agent.info.steps !== undefined && step >= loaded.agent.info.steps
+        // Finish the deferred exchange before a checkpoint can hide its original owner.
+        if (pendingTools.length === 0) {
+          const compacted = yield* compaction.compact({ reason: "auto", context: loaded })
+          if (compacted.status === "failed") return yield* new StepFailedError({ error: compacted.error })
+          if (compacted.status === "completed") {
+            assistantMessageID = SessionMessage.ID.create()
+            continue
+          }
+        }
         const transcript = SessionModelRequest.baseTranscript({
           agent: loaded.agent.info,
           model: loaded.model,
@@ -249,6 +296,7 @@ const layer = Layer.effect(
           agent: loaded.agent.id,
           model: loaded.model,
           prepared,
+          pendingTools,
           retry: (cause, error, proposed) =>
             retry.decide({
               cause,
@@ -260,7 +308,7 @@ const layer = Layer.effect(
             }),
           recoverContinuation,
           recoverOverflow: Effect.suspend(() =>
-            recoverOverflow
+            recoverOverflow && pendingTools.length === 0
               ? compaction
                   .compact({ reason: "overflow", context: loaded })
                   .pipe(Effect.map((result) => result.status === "completed"))
@@ -328,11 +376,13 @@ const layer = Layer.effect(
 
     const settleStaleToolCalls = Effect.fn("SessionRunner.settleStaleToolCalls")(function* (
       sessionID: SessionSchema.ID,
+      hostedOnly = false,
     ) {
       for (const message of yield* store.context(sessionID)) {
         if (message.type !== "assistant") continue
         for (const tool of message.content) {
           if (tool.type !== "tool" || (tool.state.status !== "streaming" && tool.state.status !== "running")) continue
+          if (hostedOnly && tool.executed !== true) continue
           const metadata = tool.state.status === "running" ? tool.state.metadata : undefined
           const childID =
             tool.name === "subagent" && typeof metadata?.sessionID === "string" ? metadata.sessionID : undefined
@@ -351,7 +401,14 @@ const layer = Layer.effect(
       }
     })
 
-    return Service.of({ drain })
+    return Service.of({
+      drain: (input) =>
+        drain(input).pipe(
+          // Deferred calls outlive a physical attempt, but not an abandoned drain:
+          // preparation failures, moves, reloads and cancellation must settle their owners.
+          Effect.ensuring(Effect.suspend(() => settleStaleToolCalls(input.sessionID, true)).pipe(Effect.orDie)),
+        ),
+    })
   }),
 )
 

@@ -30,7 +30,12 @@ const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 const capture = (
   providerMetadataKey = "anthropic",
-  options?: { readonly interruptProgress?: boolean; readonly beforeTextDelta?: Effect.Effect<void> },
+  options?: {
+    readonly interruptProgress?: boolean
+    readonly beforeTextDelta?: Effect.Effect<void>
+    readonly beforeToolSuccess?: Effect.Effect<void>
+    readonly pendingTools?: Parameters<typeof createLLMEventPublisher>[1]["pendingTools"]
+  },
 ) => {
   const published: Array<{ readonly type: string; readonly data: unknown }> = []
   const bus: Pick<Bus.Interface, "publish"> = {
@@ -45,6 +50,8 @@ const capture = (
       })
       if (definition.type === SessionEvent.Text.Delta.type && options?.beforeTextDelta)
         return options.beforeTextDelta.pipe(Effect.andThen(publish))
+      if (definition.type === SessionEvent.Tool.Success.type && options?.beforeToolSuccess)
+        return options.beforeToolSuccess.pipe(Effect.andThen(publish))
       return definition.type === SessionEvent.Tool.Progress.type && options?.interruptProgress
         ? publish.pipe(Effect.andThen(Effect.interrupt))
         : publish
@@ -62,6 +69,7 @@ const capture = (
       providerMetadataKey,
       started: 0,
       assistantMessageID: SessionMessage.ID.create(),
+      pendingTools: options?.pendingTools,
     }),
   }
 }
@@ -77,6 +85,69 @@ const hostedResult = LLMEvent.toolResult({
       { type: "file", uri: `data:image/png;base64,${base64}`, mime: "image/png", name: "pixel.png" },
     ],
   },
+})
+
+test("rehydrated hosted results publish once on the original owner and count as output", async () => {
+  const owner = SessionMessage.ID.create()
+  const { publisher, published } = capture("anthropic", {
+    pendingTools: [{ id: call.id, name: call.name, assistantMessageID: owner }],
+  })
+  expect(publisher.record().outputStarted).toBe(false)
+  await Effect.runPromise(publisher.publish(hostedResult))
+  expect(publisher.record().outputStarted).toBe(true)
+  expect(published).toHaveLength(1)
+  expect(published[0]?.data).toMatchObject({ assistantMessageID: owner, id: call.id, executed: true })
+  const duplicate = await Effect.runPromiseExit(publisher.publish(hostedResult))
+  expect(Exit.isFailure(duplicate)).toBe(true)
+  expect(published).toHaveLength(1)
+})
+
+test("rehydration does not admit unknown IDs or changed tool names", async () => {
+  for (const event of [
+    LLMEvent.toolResult({ ...hostedResult, id: "unknown" }),
+    LLMEvent.toolResult({ ...hostedResult, name: "different" }),
+  ]) {
+    const { publisher, published } = capture("anthropic", {
+      pendingTools: [{ id: call.id, name: call.name, assistantMessageID: SessionMessage.ID.create() }],
+    })
+    expect(Exit.isFailure(await Effect.runPromiseExit(publisher.publish(event)))).toBe(true)
+    expect(published).toHaveLength(0)
+  }
+})
+
+test("abort sweep settles inherited hosted calls on the original owner", async () => {
+  const owner = SessionMessage.ID.create()
+  const { publisher, published } = capture("anthropic", {
+    pendingTools: [{ id: call.id, name: call.name, assistantMessageID: owner }],
+  })
+  await Effect.runPromise(publisher.failUnsettledTools({ type: "aborted", message: "Cancelled" }))
+  await Effect.runPromise(publisher.failUnsettledTools({ type: "aborted", message: "Cancelled" }))
+  expect(published).toHaveLength(1)
+  expect(published[0]?.data).toMatchObject({ assistantMessageID: owner, id: call.id, error: { type: "aborted" } })
+})
+
+test("late hosted output bars transparent retry before persistence and survives cancellation", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const owner = SessionMessage.ID.create()
+      const { publisher, published } = capture("anthropic", {
+        pendingTools: [{ id: call.id, name: call.name, assistantMessageID: owner }],
+        beforeToolSuccess: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      })
+      const running = yield* publisher.publish(hostedResult).pipe(Effect.forkChild)
+      yield* Deferred.await(entered)
+      expect(publisher.record().outputStarted).toBe(true)
+      expect(published).toHaveLength(0)
+      const interrupt = yield* Fiber.interrupt(running).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(interrupt)
+      expect(published).toHaveLength(1)
+      expect(published[0]?.data).toMatchObject({ assistantMessageID: owner, id: call.id })
+    }),
+  )
 })
 
 test("local tool success serializes media base64 once through canonical content", async () => {

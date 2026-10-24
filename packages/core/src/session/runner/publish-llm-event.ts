@@ -22,6 +22,11 @@ type Input = {
   readonly snapshot?: Snapshot.ID
   readonly started: number
   readonly assistantMessageID: SessionMessage.ID
+  readonly pendingTools?: ReadonlyArray<{
+    readonly id: string
+    readonly name: string
+    readonly assistantMessageID: SessionMessage.ID
+  }>
 }
 
 const asRecord = (value: unknown): Record<string, unknown> =>
@@ -77,6 +82,7 @@ const hostedContent = (result: ToolResultValue): NonEmptyContent => {
 export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, input: Input) => {
   const deltaBatchInterval = 100
   type ToolState = {
+    readonly assistantMessageID: SessionMessage.ID
     readonly name: string
     called: boolean
     settled: boolean
@@ -84,6 +90,8 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     progress?: Tool.Metadata
   }
   const tools = new Map<string, ToolState>()
+  for (const tool of input.pendingTools ?? [])
+    tools.set(tool.id, { ...tool, called: true, settled: false, providerExecuted: true })
   const failureSnapshot = (tool: { readonly progress?: Tool.Metadata }, metadata?: Tool.Metadata) => {
     if (tool.progress === undefined) return metadata === undefined ? {} : { metadata }
     if (metadata === undefined) return { metadata: tool.progress }
@@ -283,6 +291,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     if (tools.has(event.id)) return yield* Effect.die(new Error(`Duplicate tool input start: ${event.id}`))
     yield* startAssistant()
     const tool: ToolState = {
+      assistantMessageID,
       name: event.name,
       called: false,
       settled: false,
@@ -345,7 +354,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     tool.settled = true
     yield* bus.publish(SessionEvent.Tool.Failed, {
       sessionID: input.sessionID,
-      assistantMessageID,
+      assistantMessageID: tool.assistantMessageID,
       id,
       error:
         tool.name === "subagent" && error.type === "aborted" && typeof tool.progress?.sessionID === "string"
@@ -357,11 +366,15 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     return true
   })
 
-  const failTools = Effect.fnUntraced(function* (error: SessionError.Error, mode: "all" | "hosted" | "uncalled") {
+  const failTools = Effect.fnUntraced(function* (
+    error: SessionError.Error,
+    mode: "all" | "hosted" | "uncalled" | "inherited",
+  ) {
     let failed = false
     for (const [id, tool] of tools) {
       if (tool.settled || (mode === "hosted" && !tool.providerExecuted) || (mode === "uncalled" && tool.called))
         continue
+      if (mode === "inherited" && tool.assistantMessageID === assistantMessageID) continue
       failed = (yield* failTool(id, error)) || failed
     }
     return failed
@@ -394,7 +407,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
   })
 
   const failUnsettledTools = Effect.fn("SessionRunner.failUnsettledTools")(
-    (error: SessionError.Error, scope: "hosted" | "all" = "all") => failTools(error, scope),
+    (error: SessionError.Error, scope: "hosted" | "all" | "inherited" = "all") => failTools(error, scope),
   )
 
   const publish = Effect.fnUntraced(function* (event: LLMEvent) {
@@ -487,12 +500,13 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
           return yield* Effect.die(new Error(`Duplicate tool result: ${event.id}`))
         }
         tool.settled = true
+        outputStarted = true
         const executed = event.providerExecuted === true || tool.providerExecuted
         const resultState = providerState(event.providerMetadata)
         if (event.result.type === "error") {
           yield* bus.publish(SessionEvent.Tool.Failed, {
             sessionID: input.sessionID,
-            assistantMessageID,
+            assistantMessageID: tool.assistantMessageID,
             id: event.id,
             error: { type: "tool.execution", message: stringify(event.result.value) },
             ...failureSnapshot(tool),
@@ -503,7 +517,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
         }
         yield* bus.publish(SessionEvent.Tool.Success, {
           sessionID: input.sessionID,
-          assistantMessageID,
+          assistantMessageID: tool.assistantMessageID,
           id: event.id,
           content: hostedContent(event.result),
           executed,
@@ -518,9 +532,10 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
           return yield* Effect.die(new Error(`Tool error name changed for ${event.id}: ${tool.name} -> ${event.name}`))
         if (tool.settled) return yield* Effect.die(new Error(`Duplicate tool error: ${event.id}`))
         tool.settled = true
+        outputStarted = true
         yield* bus.publish(SessionEvent.Tool.Failed, {
           sessionID: input.sessionID,
-          assistantMessageID,
+          assistantMessageID: tool.assistantMessageID,
           id: event.id,
           error:
             event.message === `Unknown tool: ${event.name}`

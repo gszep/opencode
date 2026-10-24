@@ -48,6 +48,7 @@ interface Input {
   readonly agent: Agent.ID
   readonly model: SessionRunnerModel.Resolved
   readonly prepared: Omit<SessionModelRequest.Prepared, "event">
+  readonly pendingTools?: Parameters<typeof createLLMEventPublisher>[1]["pendingTools"]
   readonly retry: (
     cause: AIError,
     error: SessionError.Error,
@@ -79,6 +80,7 @@ export const make = Effect.gen(function* () {
       providerMetadataKey: input.model.model.route.providerMetadataKey ?? input.model.model.provider,
       snapshot: startSnapshot,
       started: yield* Clock.currentTimeMillis,
+      pendingTools: input.pendingTools,
     })
     const toolRuns: Array<{
       readonly call: ToolCall
@@ -218,7 +220,18 @@ export const make = Effect.gen(function* () {
 
         // All local fibers have joined; only provider-hosted results can still be missing.
         if (llmError || (Exit.isSuccess(stream) && !recorded.providerFailed)) {
-          const missing = yield* publisher.failUnsettledTools(RESULT_MISSING, "hosted")
+          const deferred =
+            input.model.model.route.protocol === "anthropic-messages" &&
+            recorded.finish?.finish === "tool-calls" &&
+            recorded.finish.rawFinish === "tool_use" &&
+            !llmError &&
+            !interrupted &&
+            !toolFailure &&
+            !recorded.failure &&
+            input.prepared.request.toolChoice?.type !== "none" &&
+            toolRuns.length > 0
+          // A call can be deferred once, not carried indefinitely through further client calls.
+          const missing = yield* publisher.failUnsettledTools(RESULT_MISSING, deferred ? "inherited" : "hosted")
           if (missing && !llmError && !recorded.finish) yield* publisher.failAssistant(RESULT_MISSING)
         }
 
