@@ -166,12 +166,18 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         "session.export",
         Effect.fn(function* (ctx) {
           return {
-            data: yield* transfer
-              .export({ sessionID: ctx.params.sessionID, sanitize: ctx.query.sanitize })
-              .pipe(
-                Effect.catchTag("Session.NotFoundError", missingSession),
-                Effect.catchTag("Session.MessageDecodeError", failedMessageDecode),
+            data: yield* transfer.export({ sessionID: ctx.params.sessionID, sanitize: ctx.query.sanitize }).pipe(
+              Effect.catchTag("Session.NotFoundError", missingSession),
+              Effect.catchTag("Session.MessageDecodeError", failedMessageDecode),
+              Effect.catchTag(
+                "SessionTransfer.UnsettledError",
+                (error) =>
+                  new ConflictError({
+                    message: "Session contains unsettled messages; retry export after they complete",
+                    resource: error.sessionID,
+                  }),
               ),
+            ),
           }
         }),
       )
