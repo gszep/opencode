@@ -1291,6 +1291,16 @@
               }
             }
           },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictErrorEncoded"
+                }
+              }
+            }
+          },
           "500": {
             "description": "UnknownError",
             "content": {
@@ -1302,7 +1312,7 @@
             }
           }
         },
-        "description": "Export a complete projected session transcript.",
+        "description": "Export a complete settled projected session transcript. Returns 409 while any message or tool remains unsettled; retry after completion.",
         "summary": "Export session"
       }
     },
@@ -4073,7 +4083,7 @@
             }
           }
         },
-        "description": "Interrupt active execution owned by this OpenCode process. Returns interrupted=true when an active execution was interrupted and false for the idle no-op. When resume=true, execution resumes pending steering input and next-in-line control items (manual compaction, moves) while queued prompts remain parked.",
+        "description": "Interrupt active execution owned by this OpenCode process. Without resume=true, also cancel an original root execution claim whose owner is gone and whose recovery has not begun. True idle, live foreign owners, unowned children and recovery already in progress remain no-ops. When resume=true, execution resumes pending steering input and next-in-line control items (manual compaction, moves) while queued prompts remain parked.",
         "summary": "Interrupt session execution"
       }
     },
@@ -18271,7 +18281,7 @@
         "properties": {
           "interrupted": {
             "type": "boolean",
-            "description": "Whether an active execution owned by this OpenCode process was interrupted."
+            "description": "Whether local execution was interrupted or an original dead-owner root intent was cancelled."
           }
         },
         "required": ["interrupted"],
