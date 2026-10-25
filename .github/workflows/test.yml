@@ -123,15 +123,33 @@ jobs:
         run: |
           # Public GitHub runners have 4 vCPUs / 16 GB. One package task at a
           # time leaves room for its own test/build subprocesses on each VM.
+          diagnostics=()
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Stream before task completion so an early exit cannot hide buffered output.
+            diagnostics=(--log-order=stream --log-file=.turbo/unit-diagnostic.json --summarize)
+          fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            GITHUB_ACTIONS=false bun turbo test --concurrency=1
+            GITHUB_ACTIONS=false bun turbo test --concurrency=1 "${diagnostics[@]}"
             exit 0
           fi
-          GITHUB_ACTIONS=false bun turbo test --affected --concurrency=1
+          GITHUB_ACTIONS=false bun turbo test --affected --concurrency=1 "${diagnostics[@]}"
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
           TURBO_SCM_BASE: ${{ github.event_name == 'pull_request' && format('{0}^1', github.sha) || github.event.before }}
           TURBO_SCM_HEAD: ${{ github.sha }}
+
+      - name: Upload Windows unit diagnostics
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unit-windows-${{ github.run_attempt }}
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            .turbo/unit-diagnostic.json
+            .turbo/runs/*.json
+            packages/**/.turbo/turbo-test.log
 
       - name: Verify published codemode package
         if: runner.os == 'Linux'
