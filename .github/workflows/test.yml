@@ -97,6 +97,12 @@ jobs:
           git config --global user.email "bot@opencode.ai"
           git config --global user.name "opencode"
 
+      - name: Provision offline test ripgrep
+        timeout-minutes: 3
+        run: |
+          python -m unittest discover -s .github/scripts -p 'test_setup_ripgrep.py'
+          python .github/scripts/setup_ripgrep.py
+
       - name: Install ffmpeg
         if: runner.os == 'Linux'
         run: |
