@@ -4,6 +4,7 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tarfile
@@ -61,8 +62,9 @@ def main():
         if len(data) > 8 * 1024 * 1024:
             raise ValueError("ripgrep archive exceeds setup size bound")
         target = install(data, platform, directory)
-        version = subprocess.check_output([str(target), "--version"], text=True, timeout=10)
-        if version.splitlines()[0] != f"ripgrep {VERSION}":
+        version = subprocess.check_output([str(target), "-V"], text=True, timeout=10)
+        # Release builds may append the git revision (upstream flags/doc/version.rs).
+        if not re.fullmatch(rf"ripgrep {re.escape(VERSION)}(?: \(rev [0-9a-f]+\))?(?:\r?\n)?", version):
             raise ValueError("unexpected ripgrep version")
         with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as output:
             output.write(str(directory) + "\n")

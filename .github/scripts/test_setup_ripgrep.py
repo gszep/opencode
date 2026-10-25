@@ -76,8 +76,22 @@ class InstallTests(unittest.TestCase):
 
     def test_publish_only_after_version_check(self):
         for platform in setup_ripgrep.ASSETS:
-            for valid in [False, True]:
-                with self.subTest(platform=platform, valid=valid), tempfile.TemporaryDirectory() as temporary:
+            for output, valid in [
+                ("ripgrep 15.1.0\n", True),
+                ("ripgrep 15.1.0 (rev af60c2de9d)\n", True),
+                ("ripgrep 15.1.0 (rev af60c2de9d)\r\n", True),
+                ("ripgrep 15.1.0", True),
+                ("ripgrep 15.1.0\nripgrep 99\n", False),
+                ("ripgrep 15.1.0 (rev af60c2de9d)\narbitrary tail\n", False),
+                ("ripgrep 15.1.0\n\n", False),
+                ("ripgrep 15.1.0\r", False),
+                ("ripgrep 14.0.0\n", False),
+                ("ripgrep 15.1.01\n", False),
+                ("ripgrep 15.1.0-unreviewed\n", False),
+                ("ripgrep 15.1.0 (rev not-a-hash)\n", False),
+                ("", False),
+            ]:
+                with self.subTest(platform=platform, output=output), tempfile.TemporaryDirectory() as temporary:
                     data = self.archive(platform)
                     asset, _ = setup_ripgrep.ASSETS[platform]
                     environment = {
@@ -92,7 +106,7 @@ class InstallTests(unittest.TestCase):
                         patch.object(setup_ripgrep.urllib.request, "urlopen", return_value=io.BytesIO(data)) as download,
                         patch.object(
                             setup_ripgrep.subprocess, "check_output",
-                            return_value="ripgrep 15.1.0\n" if valid else "ripgrep 14.0.0\n",
+                            return_value=output,
                         ) as version,
                     ):
                         if valid:
@@ -104,6 +118,8 @@ class InstallTests(unittest.TestCase):
                             with self.assertRaisesRegex(ValueError, "unexpected ripgrep version"):
                                 setup_ripgrep.main()
                             self.assertEqual(list(Path(temporary).iterdir()), [])
+                        self.assertEqual(version.call_args.args[0][1:], ["-V"])
+                        self.assertEqual(version.call_args.kwargs, {"text": True, "timeout": 10})
                         download.assert_called_once_with(f"https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-{asset}", timeout=60)
 
 
