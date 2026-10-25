@@ -371,6 +371,15 @@ function normalizeCompaction(
     : undefined
   const buffer = prefer(legacyBuffer, nativeBuffer, ["compaction", "buffer"], diagnostics)
   if (buffer !== undefined) result.buffer = buffer
+  if (own(input.compaction, "input_cap")) {
+    const value = decodeEncoded(
+      ConfigCompaction.Info.fields.input_cap,
+      input.compaction.input_cap,
+      ["compaction", "input_cap"],
+      diagnostics,
+    )
+    if (value !== undefined) result.input_cap = value
+  }
   if (Object.keys(result).length || !Object.keys(input.compaction).length) encoded.compaction = result
 }
 

@@ -80,16 +80,47 @@ describe("ConfigNormalize", () => {
   })
 
   test("preserves arbitrary JSON-round-tripped native configuration", () => {
-    FastCheck.assert(
-      FastCheck.property(Schema.toArbitrary(Info)(FastCheck), (info) => {
-        const source = JSON.parse(JSON.stringify(Schema.encodeSync(Info)(info)))
-        const result = normalized(source)
-        expect(Schema.decodeUnknownSync(Info)(result.encoded)).toEqual(
-          Schema.decodeUnknownSync(Info)(withoutEmptyCompatibilityContainers(source)),
-        )
-      }),
-      { numRuns: 100 },
-    )
+    const property = FastCheck.property(Schema.toArbitrary(Info)(FastCheck), (info) => {
+      const source = JSON.parse(JSON.stringify(Schema.encodeSync(Info)(info)))
+      const result = normalized(source)
+      expect(Schema.decodeUnknownSync(Info)(result.encoded)).toEqual(
+        Schema.decodeUnknownSync(Info)(withoutEmptyCompatibilityContainers(source)),
+      )
+    })
+    // Replay the hosted input_cap regression, then retain fresh arbitrary coverage.
+    FastCheck.assert(property, {
+      seed: 1824264081,
+      path: "7:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:1:0:1:0:0:0:0:0:0:0:0:0",
+      numRuns: 100,
+    })
+    FastCheck.assert(property, { numRuns: 100 })
+  })
+
+  test("preserves native input caps through normalization and legacy compaction migration", () => {
+    for (const input_cap of [1, 128_000]) {
+      const source = { compaction: { input_cap } }
+      expect(normalized(source).encoded.compaction).toEqual(source.compaction)
+      const migrated = normalized({
+        compaction: { auto: true, input_cap, preserve_recent_tokens: 15_000, reserved: 20_000 },
+      })
+      expect(migrated.encoded.compaction).toEqual({
+        auto: true,
+        input_cap,
+        keep: { tokens: 15_000 },
+        buffer: 20_000,
+      })
+      expect(decoded(migrated.encoded).compaction?.input_cap).toBe(input_cap)
+    }
+  })
+
+  test("diagnoses invalid input caps without discarding valid compaction settings", () => {
+    for (const input_cap of [0, -1, 1.5, "128000", null]) {
+      const result = normalized({ compaction: { auto: true, input_cap } })
+      expect(result.encoded.compaction).toEqual({ auto: true })
+      expect(result.diagnostics.map((item) => [item.kind, item.path])).toEqual([
+        ["invalid", ["compaction", "input_cap"]],
+      ])
+    }
   })
 
   test("merges named maps by entry and gives valid native entries precedence", () => {

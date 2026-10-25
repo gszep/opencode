@@ -1,4 +1,5 @@
 import { HttpRecorder } from "@opencode/http-recorder"
+import { defaultMatcher } from "../../http-recorder/src/http/matching"
 import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
 import { Auth, LLMClient, type LLMClientService, RequestExecutor } from "@opencode/ai/route"
 import { Model } from "@opencode/core/model"
@@ -22,6 +23,7 @@ import { SessionRunCoordinator } from "@opencode/core/session/run-coordinator"
 import { SessionRunner } from "@opencode/core/session/runner/index"
 import { SessionRunnerLLM } from "@opencode/core/session/runner/llm"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
+import { runtimeGuidance } from "@opencode/core/session/runtime-guidance"
 import { Tool } from "@opencode/core/tool"
 import { SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
@@ -37,9 +39,9 @@ import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { OptimizePlugin } from "@opencode/core/plugin/optimize"
 import { IdentityPlugin } from "@opencode/core/plugin/identity"
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { eq } from "drizzle-orm"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import path from "node:path"
 import { testEffect } from "./lib/effect"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
@@ -53,7 +55,84 @@ if (process.env.RECORD === "true") {
   if (process.env.CI !== undefined) throw new Error("Unset CI before recording HTTP cassettes")
   HttpRecorder.removeCassetteSync(cassetteName, { directory: cassetteDirectory })
 }
-const cassette = HttpRecorder.layerFetch(cassetteName, { directory: cassetteDirectory })
+const replayBody = Schema.fromJsonString(
+  Schema.StructWithRest(
+    Schema.Struct({
+      messages: Schema.Array(
+        Schema.StructWithRest(Schema.Struct({ role: Schema.String, content: Schema.String }), [
+          Schema.Record(Schema.String, Schema.Json),
+        ]),
+      ),
+    }),
+    [Schema.Record(Schema.String, Schema.Json)],
+  ),
+)
+// Keep the historical response and recording unchanged. Its expected request
+// predates the carried guidance; require that exact source-owned suffix while
+// retaining exact matching for every other request field.
+const matchCarriedRequest: HttpRecorder.RequestMatcher = (incoming, recorded) => {
+  const body = Option.getOrUndefined(Schema.decodeUnknownOption(replayBody)(recorded.body))
+  if (!body || body.messages.filter((message) => message.role === "system").length !== 1) return false
+  return defaultMatcher(incoming, {
+    ...recorded,
+    body: JSON.stringify({
+      ...body,
+      messages: body.messages.map((message) =>
+        message.role !== "system" || message.content.endsWith(`\n${runtimeGuidance}`)
+          ? message
+          : { ...message, content: `${message.content}\n${runtimeGuidance}` },
+      ),
+    }),
+  })
+}
+const cassette = HttpRecorder.layerFetch(cassetteName, { directory: cassetteDirectory, match: matchCarriedRequest })
+
+test("recorded replay requires exact carried guidance and preserves all other request checks", () => {
+  const body = {
+    model: "fixture",
+    messages: [
+      { role: "system", content: "Fixture" },
+      { role: "user", content: "Hello" },
+    ],
+    max_tokens: 20,
+  }
+  const recorded = {
+    method: "POST",
+    url: "https://example.test/model",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }
+  const current = { ...body, messages: [{ role: "system", content: `Fixture\n${runtimeGuidance}` }, body.messages[1]] }
+  const incoming = { ...recorded, body: JSON.stringify(current) }
+  expect(matchCarriedRequest(incoming, recorded)).toBe(true)
+  expect(matchCarriedRequest(recorded, recorded)).toBe(false)
+  expect(matchCarriedRequest({ ...incoming, method: "GET" }, recorded)).toBe(false)
+  expect(matchCarriedRequest({ ...incoming, url: "https://other.test/model" }, recorded)).toBe(false)
+  expect(matchCarriedRequest({ ...incoming, body: JSON.stringify({ ...current, max_tokens: 21 }) }, recorded)).toBe(
+    false,
+  )
+  expect(
+    matchCarriedRequest(
+      {
+        ...incoming,
+        body: JSON.stringify({ ...current, messages: [...current.messages, { role: "user", content: "Extra" }] }),
+      },
+      recorded,
+    ),
+  ).toBe(false)
+  expect(
+    matchCarriedRequest(
+      {
+        ...incoming,
+        body: JSON.stringify({
+          ...current,
+          messages: [{ role: "system", content: `Fixture\n${runtimeGuidance}\n${runtimeGuidance}` }, body.messages[1]],
+        }),
+      },
+      recorded,
+    ),
+  ).toBe(false)
+})
 const executor = RequestExecutor.layer.pipe(Layer.provide(cassette))
 const client = LLMClient.layer.pipe(Layer.provide(executor))
 const permission = permissionLayer()
@@ -176,6 +255,13 @@ describe("SessionRunnerLLM recorded", () => {
       const agents = yield* Agent.Service
       const models = yield* Model.Service
       const hooks = yield* PluginHooks.Service
+      // A deterministic replay mismatch is not a transient provider failure.
+      // Fail with its real error rather than waiting on the test clock's backoff.
+      yield* hooks.register("session", "retry", (event) =>
+        Effect.sync(() => {
+          event.decision = { retry: false }
+        }),
+      )
       yield* agents.transform((editor) =>
         editor.update(Agent.ID.make("build"), (agent) => {
           agent.mode = "primary"
