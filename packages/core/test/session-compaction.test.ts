@@ -333,6 +333,103 @@ const loaded = (session: Session.Info, messages: readonly SessionMessage.Info[])
   tools: { definitions: [], execute: () => Effect.die("Compaction must not execute tools") },
 })
 
+const policyInput = (
+  tokens: number,
+  selected: SessionRunnerModel.Resolved,
+  session: Session.Info,
+  agent = Agent.defaultID,
+) => {
+  const messages = [
+    SessionMessage.Assistant.make({
+      id: SessionMessage.ID.create(),
+      type: "assistant",
+      agent,
+      model: selected.ref,
+      content: [],
+      tokens: { input: tokens, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      time: { created: DateTime.makeUnsafe(0), completed: DateTime.makeUnsafe(0) },
+    }),
+  ]
+  return {
+    session,
+    resolved: selected,
+    messages,
+    context: { ...loaded(session, messages), model: selected, agent: { id: agent, info: Agent.Info.default(agent) } },
+  }
+}
+
+for (const mode of ["summary", "native"] as const)
+  it.effect(`${mode} input cap uses the minimum safe ceiling across models, providers, agents and child contexts`, () =>
+    Effect.gen(function* () {
+      const compaction = yield* SessionCompaction.Service
+      const session = yield* insertSession(Session.ID.create())
+      const profiles = [
+        { limit: { context: 1_000_000, input: 900_000, output: 128_000 }, threshold: 128_000 },
+        { limit: { context: 100_000, output: 10_000 }, threshold: 80_000 },
+        { limit: { context: 1_000_000, input: 100_000, output: 32_000 }, threshold: 80_000 },
+        { limit: { context: 100_000, output: 30_000 }, threshold: 70_000 },
+        { limit: { context: 0, output: 0 }, threshold: 128_000 },
+        { limit: { context: 0, input: 90_000, output: 32_000 }, threshold: 70_000 },
+      ]
+      const huge = { ...resolved, compaction: { type: mode }, limit: profiles[0].limit }
+      expect(compaction.required(policyInput(128_000, huge, session))).toBe(false)
+      expect(compaction.required(policyInput(1_000_000, { ...huge, limit: profiles[4].limit }, session))).toBe(false)
+      yield* compaction.transform((editor) => editor.configure({ inputCap: 128_000 }))
+      for (const [provider, id, child] of [
+        ["provider-a", "large-model", false],
+        ["new-custom-provider", "unlisted-new-model", true],
+      ] as const) {
+        for (const profile of profiles) {
+          const limit = Object.freeze({ ...profile.limit })
+          const selected = SessionRunnerModel.resolved(LanguageModel.make({ id, provider, route: OpenAIChat.route }), {
+            capabilities: resolved.capabilities,
+            cost: [],
+            limit,
+            compaction: { type: mode },
+          })
+          const context = child ? { ...session, parentID: Session.ID.make("ses_parent_cap") } : session
+          const agent = Agent.ID.make(child ? "custom-reviewer" : "build")
+          expect(SessionCompaction.estimateTokens(policyInput(profile.threshold, selected, context, agent))).toBe(
+            profile.threshold,
+          )
+          expect(compaction.required(policyInput(profile.threshold - 1, selected, context, agent))).toBe(false)
+          expect(compaction.required(policyInput(profile.threshold, selected, context, agent))).toBe(true)
+          expect(selected.limit).toEqual(profile.limit)
+          expect(selected.ref).toMatchObject({ providerID: provider, id })
+          expect(Object.isFrozen(limit)).toBe(true)
+        }
+      }
+      // Return to a previous model after switching: the operational cap is not catalog state.
+      expect(compaction.required(policyInput(127_999, huge, session))).toBe(false)
+      expect(compaction.required(policyInput(128_000, huge, session))).toBe(true)
+      yield* compaction.transform((editor) => editor.configure({ auto: false }))
+      expect(compaction.required(policyInput(900_000, huge, session))).toBe(false)
+      expect(huge.limit).toEqual(profiles[0].limit)
+    }),
+  )
+
+it.effect("an over-cap summary and retained newest exchange do not trigger immediate repeated compaction", () =>
+  Effect.gen(function* () {
+    const compaction = yield* SessionCompaction.Service
+    const session = yield* insertSession(Session.ID.create())
+    yield* compaction.transform((editor) => editor.configure({ inputCap: 128_000 }))
+    const input = policyInput(128_000, { ...resolved, limit: { context: 1_000_000, output: 32_000 } }, session)
+    const checkpoint = SessionMessage.CompactionCompleted.make({
+      id: SessionMessage.ID.create(),
+      type: "compaction",
+      status: "completed",
+      reason: "auto",
+      summary: "## Objective\n" + "s".repeat(512_000),
+      recent: "Newest exchange\n" + "r".repeat(512_000),
+      time: { created: DateTime.makeUnsafe(0) },
+    })
+    const messages = [checkpoint]
+    const after = { ...input, messages, context: { ...input.context, messages } }
+    expect(SessionCompaction.estimateTokens(after)).toBeGreaterThan(128_000)
+    expect(compaction.required(after)).toBe(false)
+  }),
+)
+
 it.effect("manual compaction summarizes short context instead of no-op", () =>
   Effect.gen(function* () {
     requests = []

@@ -2846,6 +2846,131 @@ describe("SessionRunnerLLM", () => {
     ).toHaveLength(1)
   })
 
+  scenario("applies an input cap enabled during active work only after local tools settle", function* (s) {
+    const compaction = yield* SessionCompaction.Service
+    s.currentModel = testModel("cap-safe-boundary", { context: 1_000_000, output: 32_000 })
+    yield* s.admit("Start work")
+    const tools = yield* s.blockTools()
+    yield* s.llm.push(
+      TestLLM.complete(
+        { reason: { normalized: "tool-calls" }, usage: { nonCachedInputTokens: 128_000 } },
+        LLMEvent.toolCall({ id: "cap-local", name: "echo", input: { text: "once" } }),
+      ),
+      TestLLM.text("## Objective\n- Preserve active work", "cap-summary"),
+      TestLLM.text("Done", "cap-done"),
+    )
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* tools.started
+    yield* compaction.transform((editor) => editor.configure({ inputCap: 128_000 }))
+    expect(s.requests).toHaveLength(1)
+    expect(yield* recordedEventTypes(sessionID)).not.toContain("session.compaction.started.1")
+    yield* tools.release
+    yield* Fiber.join(run)
+    expect(s.executions).toEqual(["once"])
+    expect(s.requests).toHaveLength(3)
+    expect(userTexts(s.requests[1]).at(-1)).toBe(SessionCompaction.buildPrompt(false))
+    expect(userTexts(s.requests[2]).join("\n")).toContain("<conversation-checkpoint>")
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.indexOf("session.tool.success.2")).toBeLessThan(events.indexOf("session.compaction.started.1"))
+    expect(events.filter((type) => type === "session.compaction.ended.1")).toHaveLength(1)
+    expect(modelLimits.get("cap-safe-boundary")).toEqual({ context: 1_000_000, output: 32_000 })
+  })
+
+  scenario("an input cap preserves pending hosted continuation until its original result settles", function* (s) {
+    s.currentModel = LanguageModel.make({ id: "cap-anthropic", provider: "anthropic", route: AnthropicMessages.route })
+    modelLimits.set("cap-anthropic", { context: 1_000_000, output: 32_000 })
+    const compaction = yield* SessionCompaction.Service
+    yield* compaction.transform((editor) => editor.configure({ inputCap: 128_000 }))
+    yield* s.admit("Search and echo")
+    yield* s.llm.push(
+      TestLLM.complete(
+        { reason: { normalized: "tool-calls", raw: "tool_use" }, usage: { nonCachedInputTokens: 128_000 } },
+        hostedCall("cap-hosted", "Effect"),
+        LLMEvent.toolCall({ id: "cap-first", name: "echo", input: { text: "first" } }),
+      ),
+      TestLLM.complete(
+        { reason: { normalized: "tool-calls", raw: "tool_use" }, usage: { nonCachedInputTokens: 128_000 } },
+        LLMEvent.toolResult({
+          id: "cap-hosted",
+          name: "web_search",
+          providerExecuted: true,
+          result: { type: "json", value: [] },
+          providerMetadata: { anthropic: { result: [] } },
+        }),
+        LLMEvent.toolCall({ id: "cap-second", name: "echo", input: { text: "second" } }),
+      ),
+      TestLLM.text("## Objective\n- Preserve completed search", "cap-hosted-summary"),
+      TestLLM.text("Done", "cap-hosted-done"),
+    )
+    yield* s.resume
+    expect(s.executions).toEqual(["first", "second"])
+    expect(s.requests).toHaveLength(4)
+    const pending = s.requests[1].messages.flatMap((message) => message.content)
+    expect(pending.filter((part) => part.type === "tool-call" && part.id === "cap-hosted")).toHaveLength(1)
+    expect(pending.filter((part) => part.type === "tool-result" && part.id === "cap-hosted")).toHaveLength(0)
+    expect(userTexts(s.requests[2]).at(-1)).toBe(SessionCompaction.buildPrompt(false))
+    const owner = (yield* s.messages).find(
+      (message) =>
+        message.type === "assistant" &&
+        message.content.some((part) => part.type === "tool" && part.id === "cap-hosted"),
+    )
+    if (!owner) return yield* Effect.die("Missing original hosted-call owner")
+    const events = yield* recordedStepSettlementEvents(sessionID, owner.id)
+    expect(events.filter((event) => event.data.id === "cap-hosted").map((event) => event.type)).toEqual([
+      "session.tool.called.1",
+      "session.tool.success.2",
+    ])
+    const ordered = yield* recordedEventTypes(sessionID)
+    expect(ordered.lastIndexOf("session.tool.success.2")).toBeLessThan(ordered.indexOf("session.compaction.started.1"))
+  })
+
+  scenario(
+    "an input cap runs an oversized new summary and retained exchange once before reconsidering compaction",
+    function* (s) {
+      s.currentModel = testModel("cap-oversized-checkpoint", { context: 1_000_000, output: 32_000 })
+      yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "cap-earlier", 128_000))
+      yield* s.runPrompt("Earlier question")
+      const compaction = yield* SessionCompaction.Service
+      yield* compaction.transform((editor) => editor.configure({ inputCap: 128_000, tokens: 15_000 }))
+      const newest = "Newest exact exchange\n" + "n".repeat(512_000)
+      const summary = "## Objective\n" + "s".repeat(512_000)
+      s.requests.length = 0
+      yield* s.llm.push(TestLLM.text(summary, "cap-large-summary"), TestLLM.text("Continued", "cap-resumed"))
+      yield* s.runPrompt(newest)
+      expect(s.requests).toHaveLength(2)
+      expect(userTexts(s.requests[0]).at(-1)).toBe(SessionCompaction.buildPrompt(false))
+      expect(userTexts(s.requests[1]).join("\n")).toContain(summary)
+      expect(userTexts(s.requests[1]).join("\n")).toContain(newest)
+      expect((yield* s.context)[0]).toMatchObject({ type: "compaction", summary, recent: `[User]: ${newest}` })
+      expect(
+        (yield* recordedEventTypes(sessionID)).filter((type) => type === "session.compaction.started.1"),
+      ).toHaveLength(1)
+    },
+  )
+
+  scenario("a native input-cap checkpoint waits for fresh primary usage rather than looping", function* (s) {
+    s.currentModel = LanguageModel.make({ id: "native-cap", provider: "openai", route: OpenAIResponses.route })
+    modelLimits.set("native-cap", { context: 1_000_000, output: 32_000 })
+    s.compaction = { type: "native" }
+    const compaction = yield* SessionCompaction.Service
+    yield* compaction.transform((editor) => editor.configure({ inputCap: 128_000 }))
+    yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "native-cap-history", 128_000))
+    yield* s.runPrompt("First real request")
+    yield* s.llm.push(
+      CompactionCheckpointResponse.make({
+        responseID: "resp_native_cap",
+        checkpoint: { type: "compaction", provider: s.currentModel.provider, encrypted: "cap-window" },
+      }),
+      TestLLM.text("No fresh usage", "native-cap-continued"),
+    )
+    yield* s.runPrompt("Second request")
+    yield* s.llm.push(TestLLM.text("Still no usage", "native-cap-followup"))
+    yield* s.runPrompt("Third request")
+    expect(s.requests).toHaveLength(4)
+    expect(JSON.stringify(s.requests[3].messages)).toContain("cap-window")
+    expect((yield* s.messages).filter((message) => message.type === "compaction")).toHaveLength(1)
+  })
+
   scenario("automatically compacts into a completed summary and retained recent turn", function* (s) {
     const store = yield* SessionStore.Service
     yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-first", 3_950))

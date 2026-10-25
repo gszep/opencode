@@ -91,6 +91,7 @@ export type Settings = {
   auto: boolean
   buffer: number
   tokens: number
+  inputCap?: number
 }
 
 export type NativeInput = {
@@ -407,6 +408,7 @@ export const layer = Layer.effect(
           if (settings.auto !== undefined) editor.auto = settings.auto
           if (settings.buffer !== undefined) editor.buffer = settings.buffer
           if (settings.tokens !== undefined) editor.tokens = settings.tokens
+          if (settings.inputCap !== undefined) editor.inputCap = settings.inputCap
         },
         native: (strategy) => {
           editor.native.push(strategy)
@@ -753,11 +755,14 @@ export const layer = Layer.effect(
         return false
       const limit = input.resolved.limit
       const context = limit.context
-      if (context <= 0) return false
+      // An explicit operational cap can also bound routes with unknown capacity;
+      // without one, retain the existing unknown-capacity behavior.
+      if (context <= 0 && config.inputCap === undefined) return false
       const output = Math.min(limit.output, OUTPUT_TOKEN_MAX)
       const promptCeiling = Math.min(
         limit.input === undefined ? Number.POSITIVE_INFINITY : limit.input - config.buffer,
-        context - Math.max(output, config.buffer),
+        context > 0 ? context - Math.max(output, config.buffer) : Number.POSITIVE_INFINITY,
+        config.inputCap ?? Number.POSITIVE_INFINITY,
       )
       return estimateTokens(input) >= promptCeiling
     }
