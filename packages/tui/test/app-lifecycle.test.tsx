@@ -8,6 +8,7 @@ import path from "node:path"
 import { createEventStream, createFetch, directory, json } from "./fixture/tui-client"
 import { tmpdir } from "./fixture/fixture"
 import { createAppFixture } from "./fixture/app"
+import { waitForHighlightedFrame } from "./fixture/highlighted-frame"
 import type { PluginInfo } from "@opencode/client"
 
 test.each([100, 44])("Ctrl-O is immediate, dismissible, and prunes cached deletions at width %s", async (width) => {
@@ -620,7 +621,8 @@ test.each([80, 120])("completes custom Markdown and ordinary fences in a session
       return undefined
     },
   })
-  const streaming = await setup.waitForFrame(
+  const streaming = await waitForHighlightedFrame(
+    setup,
     (frame) =>
       frame.includes("initial") &&
       frame.includes("DiagramStart") &&
@@ -658,7 +660,8 @@ test.each([80, 120])("completes custom Markdown and ordinary fences in a session
       tokens: session.tokens,
     },
   })
-  const frame = await setup.waitForFrame(
+  const frame = await waitForHighlightedFrame(
+    setup,
     (frame) => frame.includes("MARKDOWN_END") && frame.includes("initial final") && frame.includes("2ms"),
   )
   expect(frame).toContain("DiagramStart")
