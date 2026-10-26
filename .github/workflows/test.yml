@@ -24,7 +24,7 @@ env:
 jobs:
   affected:
     name: affected packages
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     outputs:
       app: ${{ steps.packages.outputs.app }}
     steps:
@@ -56,12 +56,13 @@ jobs:
     name: unit (${{ matrix.settings.name }})
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         settings:
           - name: linux
-            host: blacksmith-4vcpu-ubuntu-2404
+            host: ubuntu-24.04
           - name: windows
-            host: blacksmith-4vcpu-windows-2025
+            host: windows-2025
     runs-on: ${{ matrix.settings.host }}
     defaults:
       run:
@@ -80,6 +81,8 @@ jobs:
 
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
+        with:
+          install-flags: --concurrent-scripts=2
 
       - name: Test Effect simplification rules
         if: runner.os == 'Linux'
@@ -93,6 +96,12 @@ jobs:
         run: |
           git config --global user.email "bot@opencode.ai"
           git config --global user.name "opencode"
+
+      - name: Provision offline test ripgrep
+        timeout-minutes: 3
+        run: |
+          python -m unittest discover -s .github/scripts -p 'test_setup_ripgrep.py'
+          python .github/scripts/setup_ripgrep.py
 
       - name: Install ffmpeg
         if: runner.os == 'Linux'
@@ -112,16 +121,35 @@ jobs:
       - name: Run unit tests
         timeout-minutes: 20
         run: |
-          # The runners have four vCPUs, and each Bun test process performs its own concurrent work.
+          # Public GitHub runners have 4 vCPUs / 16 GB. One package task at a
+          # time leaves room for its own test/build subprocesses on each VM.
+          diagnostics=()
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Stream before task completion so an early exit cannot hide buffered output.
+            diagnostics=(--log-order=stream --log-file=.turbo/unit-diagnostic.json --summarize)
+          fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            GITHUB_ACTIONS=false bun turbo test --concurrency=3
+            GITHUB_ACTIONS=false bun turbo test --concurrency=1 "${diagnostics[@]}"
             exit 0
           fi
-          GITHUB_ACTIONS=false bun turbo test --affected --concurrency=3
+          GITHUB_ACTIONS=false bun turbo test --affected --concurrency=1 "${diagnostics[@]}"
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
           TURBO_SCM_BASE: ${{ github.event_name == 'pull_request' && format('{0}^1', github.sha) || github.event.before }}
           TURBO_SCM_HEAD: ${{ github.sha }}
+
+      - name: Upload Windows unit diagnostics
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unit-windows-${{ github.run_attempt }}
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            .turbo/unit-diagnostic.json
+            .turbo/runs/*.json
+            packages/**/.turbo/turbo-test.log
 
       - name: Verify published codemode package
         if: runner.os == 'Linux'
@@ -179,19 +207,25 @@ jobs:
 
   e2e:
     name: e2e (${{ matrix.settings.name }})
-    needs: affected
+    # Share a two-heavy-job budget with unit, rather than starting four VMs.
+    # Unit failure must not suppress independent browser coverage.
+    needs: [affected, unit]
+    if: ${{ !cancelled() && needs.affected.result == 'success' }}
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         settings:
           - name: linux
-            host: blacksmith-4vcpu-ubuntu-2404
+            host: ubuntu-24.04
           - name: windows
-            host: blacksmith-4vcpu-windows-2025
+            host: windows-2025
     runs-on: ${{ matrix.settings.host }}
     env:
       E2E_ENABLED: ${{ needs.affected.outputs.app == 'true' && github.ref_name != 'v2' && github.head_ref != 'v2' }}
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
+      # Reserve two CPUs for the preview server and browser subprocesses.
+      PLAYWRIGHT_WORKERS: 2
     defaults:
       run:
         shell: bash
@@ -212,6 +246,8 @@ jobs:
       - name: Setup Bun
         if: env.E2E_ENABLED == 'true'
         uses: ./.github/actions/setup-bun
+        with:
+          install-flags: --concurrent-scripts=2
 
       - name: Read Playwright version
         if: env.E2E_ENABLED == 'true'

@@ -587,7 +587,7 @@ export function make(options: ClientOptions) {
             path: `/api/experimental/session/${encodeURIComponent(input.sessionID)}/export`,
             query: { sanitize: input["sanitize"] },
             successStatus: 200,
-            declaredStatuses: [400, 401, 404, 500],
+            declaredStatuses: [400, 401, 404, 409, 500],
             empty: false,
           },
           requestOptions,

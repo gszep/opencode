@@ -17,7 +17,7 @@ import {
   UnknownProviderError,
 } from "@opencode/ai"
 import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
-import { AnthropicMessages, OpenAIResponses } from "@opencode/ai/protocols"
+import { AnthropicMessages, Gemini, OpenAIResponses } from "@opencode/ai/protocols"
 import { compileRequest } from "@opencode/ai/route/client"
 import { TestLLM } from "@opencode/ai/testing"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
@@ -67,6 +67,7 @@ import type { Info as ToolInfo } from "@opencode/schema/tool"
 import { InstructionStateTable, SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { InstructionEntry } from "@opencode/core/session/instruction-entry"
 import { SessionStore } from "@opencode/core/session/store"
+import { SessionTransfer } from "@opencode/core/session/transfer"
 import { Instructions } from "@opencode/core/instructions/index"
 import { InstructionBuiltIns } from "@opencode/core/instructions/builtins"
 import { InstructionDiscovery } from "@opencode/core/instruction-discovery"
@@ -482,6 +483,7 @@ const layer = Layer.unwrap(
         SessionRunnerLLM.node,
         SessionExecution.node,
         Session.node,
+        SessionTransfer.node,
       ]),
       [
         ...replacements,
@@ -2844,6 +2846,131 @@ describe("SessionRunnerLLM", () => {
     ).toHaveLength(1)
   })
 
+  scenario("applies an input cap enabled during active work only after local tools settle", function* (s) {
+    const compaction = yield* SessionCompaction.Service
+    s.currentModel = testModel("cap-safe-boundary", { context: 1_000_000, output: 32_000 })
+    yield* s.admit("Start work")
+    const tools = yield* s.blockTools()
+    yield* s.llm.push(
+      TestLLM.complete(
+        { reason: { normalized: "tool-calls" }, usage: { nonCachedInputTokens: 128_000 } },
+        LLMEvent.toolCall({ id: "cap-local", name: "echo", input: { text: "once" } }),
+      ),
+      TestLLM.text("## Objective\n- Preserve active work", "cap-summary"),
+      TestLLM.text("Done", "cap-done"),
+    )
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* tools.started
+    yield* compaction.transform((editor) => editor.configure({ inputCap: 128_000 }))
+    expect(s.requests).toHaveLength(1)
+    expect(yield* recordedEventTypes(sessionID)).not.toContain("session.compaction.started.1")
+    yield* tools.release
+    yield* Fiber.join(run)
+    expect(s.executions).toEqual(["once"])
+    expect(s.requests).toHaveLength(3)
+    expect(userTexts(s.requests[1]).at(-1)).toBe(SessionCompaction.buildPrompt(false))
+    expect(userTexts(s.requests[2]).join("\n")).toContain("<conversation-checkpoint>")
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.indexOf("session.tool.success.2")).toBeLessThan(events.indexOf("session.compaction.started.1"))
+    expect(events.filter((type) => type === "session.compaction.ended.1")).toHaveLength(1)
+    expect(modelLimits.get("cap-safe-boundary")).toEqual({ context: 1_000_000, output: 32_000 })
+  })
+
+  scenario("an input cap preserves pending hosted continuation until its original result settles", function* (s) {
+    s.currentModel = LanguageModel.make({ id: "cap-anthropic", provider: "anthropic", route: AnthropicMessages.route })
+    modelLimits.set("cap-anthropic", { context: 1_000_000, output: 32_000 })
+    const compaction = yield* SessionCompaction.Service
+    yield* compaction.transform((editor) => editor.configure({ inputCap: 128_000 }))
+    yield* s.admit("Search and echo")
+    yield* s.llm.push(
+      TestLLM.complete(
+        { reason: { normalized: "tool-calls", raw: "tool_use" }, usage: { nonCachedInputTokens: 128_000 } },
+        hostedCall("cap-hosted", "Effect"),
+        LLMEvent.toolCall({ id: "cap-first", name: "echo", input: { text: "first" } }),
+      ),
+      TestLLM.complete(
+        { reason: { normalized: "tool-calls", raw: "tool_use" }, usage: { nonCachedInputTokens: 128_000 } },
+        LLMEvent.toolResult({
+          id: "cap-hosted",
+          name: "web_search",
+          providerExecuted: true,
+          result: { type: "json", value: [] },
+          providerMetadata: { anthropic: { result: [] } },
+        }),
+        LLMEvent.toolCall({ id: "cap-second", name: "echo", input: { text: "second" } }),
+      ),
+      TestLLM.text("## Objective\n- Preserve completed search", "cap-hosted-summary"),
+      TestLLM.text("Done", "cap-hosted-done"),
+    )
+    yield* s.resume
+    expect(s.executions).toEqual(["first", "second"])
+    expect(s.requests).toHaveLength(4)
+    const pending = s.requests[1].messages.flatMap((message) => message.content)
+    expect(pending.filter((part) => part.type === "tool-call" && part.id === "cap-hosted")).toHaveLength(1)
+    expect(pending.filter((part) => part.type === "tool-result" && part.id === "cap-hosted")).toHaveLength(0)
+    expect(userTexts(s.requests[2]).at(-1)).toBe(SessionCompaction.buildPrompt(false))
+    const owner = (yield* s.messages).find(
+      (message) =>
+        message.type === "assistant" &&
+        message.content.some((part) => part.type === "tool" && part.id === "cap-hosted"),
+    )
+    if (!owner) return yield* Effect.die("Missing original hosted-call owner")
+    const events = yield* recordedStepSettlementEvents(sessionID, owner.id)
+    expect(events.filter((event) => event.data.id === "cap-hosted").map((event) => event.type)).toEqual([
+      "session.tool.called.1",
+      "session.tool.success.2",
+    ])
+    const ordered = yield* recordedEventTypes(sessionID)
+    expect(ordered.lastIndexOf("session.tool.success.2")).toBeLessThan(ordered.indexOf("session.compaction.started.1"))
+  })
+
+  scenario(
+    "an input cap runs an oversized new summary and retained exchange once before reconsidering compaction",
+    function* (s) {
+      s.currentModel = testModel("cap-oversized-checkpoint", { context: 1_000_000, output: 32_000 })
+      yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "cap-earlier", 128_000))
+      yield* s.runPrompt("Earlier question")
+      const compaction = yield* SessionCompaction.Service
+      yield* compaction.transform((editor) => editor.configure({ inputCap: 128_000, tokens: 15_000 }))
+      const newest = "Newest exact exchange\n" + "n".repeat(512_000)
+      const summary = "## Objective\n" + "s".repeat(512_000)
+      s.requests.length = 0
+      yield* s.llm.push(TestLLM.text(summary, "cap-large-summary"), TestLLM.text("Continued", "cap-resumed"))
+      yield* s.runPrompt(newest)
+      expect(s.requests).toHaveLength(2)
+      expect(userTexts(s.requests[0]).at(-1)).toBe(SessionCompaction.buildPrompt(false))
+      expect(userTexts(s.requests[1]).join("\n")).toContain(summary)
+      expect(userTexts(s.requests[1]).join("\n")).toContain(newest)
+      expect((yield* s.context)[0]).toMatchObject({ type: "compaction", summary, recent: `[User]: ${newest}` })
+      expect(
+        (yield* recordedEventTypes(sessionID)).filter((type) => type === "session.compaction.started.1"),
+      ).toHaveLength(1)
+    },
+  )
+
+  scenario("a native input-cap checkpoint waits for fresh primary usage rather than looping", function* (s) {
+    s.currentModel = LanguageModel.make({ id: "native-cap", provider: "openai", route: OpenAIResponses.route })
+    modelLimits.set("native-cap", { context: 1_000_000, output: 32_000 })
+    s.compaction = { type: "native" }
+    const compaction = yield* SessionCompaction.Service
+    yield* compaction.transform((editor) => editor.configure({ inputCap: 128_000 }))
+    yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "native-cap-history", 128_000))
+    yield* s.runPrompt("First real request")
+    yield* s.llm.push(
+      CompactionCheckpointResponse.make({
+        responseID: "resp_native_cap",
+        checkpoint: { type: "compaction", provider: s.currentModel.provider, encrypted: "cap-window" },
+      }),
+      TestLLM.text("No fresh usage", "native-cap-continued"),
+    )
+    yield* s.runPrompt("Second request")
+    yield* s.llm.push(TestLLM.text("Still no usage", "native-cap-followup"))
+    yield* s.runPrompt("Third request")
+    expect(s.requests).toHaveLength(4)
+    expect(JSON.stringify(s.requests[3].messages)).toContain("cap-window")
+    expect((yield* s.messages).filter((message) => message.type === "compaction")).toHaveLength(1)
+  })
+
   scenario("automatically compacts into a completed summary and retained recent turn", function* (s) {
     const store = yield* SessionStore.Service
     yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-first", 3_950))
@@ -3698,6 +3825,383 @@ describe("SessionRunnerLLM", () => {
       },
     ])
   })
+
+  for (const retry of [false, true])
+    scenario(
+      `settles an Anthropic deferred search on its original assistant${retry ? " after a pre-output retry" : ""}`,
+      function* (s) {
+        s.currentModel = LanguageModel.make({
+          id: "claude-opus-5",
+          provider: "anthropic",
+          route: AnthropicMessages.route,
+        })
+        yield* s.bus.publish(SessionEvent.ModelSelected, {
+          sessionID,
+          model: { id: ID.make("claude-opus-5"), providerID: Provider.ID.make("anthropic") },
+        })
+        yield* s.admit("Search and echo")
+        yield* s.llm.push(
+          [
+            LLMEvent.stepStart({ index: 0 }),
+            hostedCall("deferred-search", "Effect"),
+            LLMEvent.toolCall({ id: "echo-first", name: "echo", input: { text: "first" } }),
+            LLMEvent.stepFinish({ index: 0, reason: { normalized: "tool-calls", raw: "tool_use" } }),
+          ],
+          ...(retry ? [Stream.fail(providerUnavailable())] : []),
+          [
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.toolResult({
+              id: "deferred-search",
+              name: "web_search",
+              providerExecuted: true,
+              result: { type: "json", value: [] },
+              providerMetadata: { anthropic: { blockType: "web_search_tool_result", result: [] } },
+            }),
+            LLMEvent.toolCall({ id: "echo-second", name: "echo", input: { text: "second" } }),
+            LLMEvent.stepFinish({ index: 0, reason: { normalized: "tool-calls", raw: "tool_use" } }),
+          ],
+          TestLLM.text("Done", "done"),
+        )
+        if (!retry) yield* s.resume
+        if (retry) {
+          const scheduled = yield* subscribeRetries(s)
+          const run = yield* s.resume.pipe(Effect.forkChild)
+          yield* Queue.take(scheduled)
+          yield* TestClock.adjust("3 seconds")
+          yield* Fiber.join(run)
+          expect(s.requests[2]?.messages).toEqual(s.requests[1]?.messages)
+        }
+        expect(s.requests).toHaveLength(retry ? 4 : 3)
+        const pending = s.requests[1]!.messages.flatMap((message) => message.content)
+        expect(pending.filter((part) => part.type === "tool-call" && part.id === "deferred-search")).toHaveLength(1)
+        expect(pending.filter((part) => part.type === "tool-result" && part.id === "deferred-search")).toHaveLength(0)
+        const pendingWire = yield* compileRequest(s.requests[1]!)
+        expect(JSON.stringify(pendingWire.body)).toContain("server_tool_use")
+        expect(JSON.stringify(pendingWire.body)).not.toContain("web_search_tool_result")
+        const completed = s.requests.at(-1)!.messages.flatMap((message) => message.content)
+        expect(completed.filter((part) => part.type === "tool-call" && part.id === "deferred-search")).toHaveLength(1)
+        expect(completed.filter((part) => part.type === "tool-result" && part.id === "deferred-search")).toHaveLength(1)
+        const before = yield* s.context
+        expect(before.find((message) => message.type === "assistant")).toMatchObject({
+          type: "assistant",
+          content: [
+            { type: "tool", id: "deferred-search", state: { status: "completed" } },
+            { type: "tool", id: "echo-first", state: { status: "completed" } },
+          ],
+        })
+        const owner = before.find((message) => message.type === "assistant")!
+        const events = yield* recordedStepSettlementEvents(sessionID, owner.id)
+        expect(events.filter((event) => event.data.id === "deferred-search").map((event) => event.type)).toEqual([
+          "session.tool.called.1",
+          "session.tool.success.2",
+        ])
+        yield* replaySessionProjection(sessionID)
+        expect((yield* s.context).filter((message) => message.type === "assistant")).toEqual(
+          before.filter((message) => message.type === "assistant"),
+        )
+        const compiled = yield* compileRequest(s.requests.at(-1)!)
+        expect(compiled.body).toMatchObject({
+          messages: expect.arrayContaining([
+            {
+              role: "assistant",
+              content: expect.arrayContaining([
+                { type: "server_tool_use", id: "deferred-search", name: "web_search", input: { query: "Effect" } },
+                { type: "web_search_tool_result", tool_use_id: "deferred-search", content: [] },
+              ]),
+            },
+          ]),
+        })
+      },
+    )
+
+  for (const mixed of [false, true])
+    scenario(
+      `settles a deferred Anthropic search missing from the ${mixed ? "next mixed-tool" : "terminal"} response`,
+      function* (s) {
+        s.currentModel = LanguageModel.make({
+          id: "claude-opus-5",
+          provider: "anthropic",
+          route: AnthropicMessages.route,
+        })
+        yield* s.bus.publish(SessionEvent.ModelSelected, {
+          sessionID,
+          model: { id: ID.make("claude-opus-5"), providerID: Provider.ID.make("anthropic") },
+        })
+        yield* s.admit("Search and echo")
+        yield* s.llm.push(
+          [
+            LLMEvent.stepStart({ index: 0 }),
+            hostedCall("missing-deferred", "Effect"),
+            LLMEvent.toolCall({ id: "echo-first", name: "echo", input: { text: "first" } }),
+            LLMEvent.stepFinish({ index: 0, reason: { normalized: "tool-calls", raw: "tool_use" } }),
+          ],
+          ...(mixed
+            ? [
+                [
+                  LLMEvent.stepStart({ index: 0 }),
+                  hostedCall("next-deferred", "Effect"),
+                  LLMEvent.toolCall({ id: "echo-second", name: "echo", input: { text: "second" } }),
+                  LLMEvent.stepFinish({ index: 0, reason: { normalized: "tool-calls", raw: "tool_use" } }),
+                ],
+              ]
+            : []),
+          TestLLM.text("Done", "done"),
+        )
+        yield* s.resume
+        expect((yield* s.context).find((message) => message.type === "assistant")).toMatchObject({
+          type: "assistant",
+          content: [
+            {
+              type: "tool",
+              id: "missing-deferred",
+              state: { status: "error", error: { type: "tool.result-missing" } },
+            },
+            { type: "tool", id: "echo-first", state: { status: "completed" } },
+          ],
+        })
+        if (mixed) {
+          const pending = s.requests[2]!.messages.flatMap((message) => message.content)
+          expect(pending.filter((part) => part.type === "tool-call" && part.id === "missing-deferred")).toHaveLength(0)
+          expect(pending.filter((part) => part.type === "tool-call" && part.id === "next-deferred")).toHaveLength(1)
+        }
+        yield* s.llm.push(TestLLM.text("Again", "again"))
+        yield* s.runPrompt("Continue")
+        const compiled = yield* compileRequest(s.requests.at(-1)!)
+        expect(JSON.stringify(compiled.body)).not.toContain("web_search_tool_result")
+        expect(JSON.stringify(compiled.body)).not.toContain("server_tool_use")
+      },
+    )
+
+  for (const boundary of ["step limit", "steering"] as const)
+    scenario(`settles deferred Anthropic tools before a ${boundary} request changes the continuation`, function* (s) {
+      s.currentModel = LanguageModel.make({
+        id: "claude-opus-5",
+        provider: "anthropic",
+        route: AnthropicMessages.route,
+      })
+      yield* s.bus.publish(SessionEvent.ModelSelected, {
+        sessionID,
+        model: { id: ID.make("claude-opus-5"), providerID: Provider.ID.make("anthropic") },
+      })
+      const agents = yield* Agent.Service
+      yield* agents.transform((editor) =>
+        editor.update(Agent.ID.make("build"), (agent) => {
+          agent.steps = 2
+        }),
+      )
+      yield* s.admit("Search and echo")
+      yield* s.llm.push(
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          hostedCall("boundary-search", "Effect"),
+          LLMEvent.toolCall({ id: "echo-first", name: "echo", input: { text: "first" } }),
+          LLMEvent.stepFinish({ index: 0, reason: { normalized: "tool-calls", raw: "tool_use" } }),
+        ],
+        TestLLM.text("Done", "done"),
+      )
+      const run = yield* s.resumePaused
+      if (boundary === "steering") yield* s.session.prompt({ sessionID, text: "Change direction" })
+      yield* run.finish
+
+      expect(s.requests).toHaveLength(2)
+      expect(s.executions).toEqual(["first"])
+      const next = s.requests[1]!
+      const compiled = yield* compileRequest(next)
+      expect(JSON.stringify(compiled.body)).not.toContain("server_tool_use")
+      expect(JSON.stringify(compiled.body)).not.toContain("web_search_tool_result")
+      const parts = next.messages.flatMap((message) => message.content)
+      expect(
+        parts.filter(
+          (part) => (part.type === "tool-call" || part.type === "tool-result") && part.id === "boundary-search",
+        ),
+      ).toHaveLength(0)
+      expect(parts.filter((part) => part.type === "tool-result" && part.id === "echo-first")).toHaveLength(1)
+      if (boundary === "step limit") {
+        expect(next.toolChoice).toEqual({ type: "none" })
+        expect(next.messages.at(-1)?.role).toBe("assistant")
+        expect(next.messages.at(-1)?.content.find((part) => part.type === "text")?.text).toContain(
+          "MAXIMUM STEPS REACHED",
+        )
+      }
+      if (boundary === "steering") {
+        expect(next.toolChoice).toBeUndefined()
+        expect(next.messages.at(-1)).toMatchObject({
+          role: "user",
+          content: [{ type: "text", text: "Change direction" }],
+        })
+      }
+      const assistant = requireAssistant(yield* s.context)
+      expect(assistant).toMatchObject({
+        content: [
+          { id: "boundary-search", state: { status: "error", error: { type: "aborted" } } },
+          { id: "echo-first", state: { status: "completed" } },
+        ],
+      })
+      const events = yield* recordedStepSettlementEvents(sessionID, assistant.id)
+      expect(events.filter((event) => event.data.id === "boundary-search").map((event) => event.type)).toEqual([
+        "session.tool.called.1",
+        "session.tool.failed.2",
+      ])
+      yield* replaySessionProjection(sessionID)
+      expect(requireAssistant(yield* s.context)).toEqual(assistant)
+    })
+
+  scenario("terminalizes a new assistant when a stale hosted result defects after input delivery", function* (s) {
+    const transfer = yield* SessionTransfer.Service
+    s.currentModel = LanguageModel.make({
+      id: "claude-opus-5",
+      provider: "anthropic",
+      route: AnthropicMessages.route,
+    })
+    yield* s.bus.publish(SessionEvent.ModelSelected, {
+      sessionID,
+      model: { id: ID.make("claude-opus-5"), providerID: Provider.ID.anthropic },
+    })
+    yield* s.llm.push(TestLLM.text("Stable baseline", "baseline"))
+    yield* s.runPrompt("Baseline")
+    const baseline = yield* transfer.export({ sessionID })
+    yield* s.llm.push(
+      Stream.concat(
+        Stream.fromIterable([
+          LLMEvent.stepStart({ index: 0 }),
+          hostedCall("stale-search", "Effect"),
+          LLMEvent.toolCall({ id: "echo-first", name: "echo", input: { text: "first" } }),
+          LLMEvent.stepFinish({ index: 0, reason: { normalized: "tool-calls", raw: "tool_use" } }),
+        ]),
+        Stream.fromEffect(s.admit("Interleaved user").pipe(Effect.orDie)).pipe(Stream.drain),
+      ),
+      [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolResult({
+          id: "stale-search",
+          name: "web_search",
+          providerExecuted: true,
+          result: { type: "json", value: [] },
+          providerMetadata: { anthropic: { blockType: "web_search_tool_result", result: [] } },
+        }),
+      ],
+    )
+    yield* s.admit("Search and echo")
+    expect(Exit.isFailure(yield* s.resume.pipe(Effect.exit))).toBe(true)
+    expect(s.executions).toEqual(["first"])
+    const context = yield* s.context
+    const failed = context.findLast((message) => message.type === "assistant")!
+    expect(failed).toMatchObject({
+      type: "assistant",
+      content: [],
+      error: { type: "unknown", message: "Tool result before call: stale-search" },
+    })
+    expect(failed.time.completed).toBeDefined()
+    const owner = context.find(
+      (message) =>
+        message.type === "assistant" &&
+        message.content.some((part) => part.type === "tool" && part.id === "stale-search"),
+    )!
+    expect(owner).toMatchObject({
+      content: [
+        { id: "stale-search", state: { status: "error", error: { type: "aborted" } } },
+        { id: "echo-first", state: { status: "completed" } },
+      ],
+    })
+    const events = yield* recordedStepSettlementEvents(sessionID, owner.id)
+    expect(events.filter((event) => event.data.id === "stale-search").map((event) => event.type)).toEqual([
+      "session.tool.called.1",
+      "session.tool.failed.2",
+    ])
+    const terminal = yield* recordedStepSettlementEvents(sessionID, failed.id)
+    expect(terminal.filter((event) => event.type === "session.step.failed.1")).toHaveLength(1)
+    const exported = yield* transfer.export({ sessionID })
+    expect(exported.messages.slice(0, baseline.messages.length)).toEqual([...baseline.messages])
+    // This fixture seeds the Session row without a Created event. Restore its
+    // original model before replaying the ModelSelected event as the boundary fixture does.
+    yield* s.db.update(SessionTable).set({ model: null }).where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+    yield* replaySessionProjection(sessionID)
+    expect((yield* transfer.export({ sessionID })).messages).toEqual(exported.messages)
+  })
+
+  scenario("settles current hosted tools when a non-AI stream defect terminates the step", function* (s) {
+    const transfer = yield* SessionTransfer.Service
+    yield* s.admit("Read a malformed provider stream")
+    yield* s.llm.push(
+      Stream.concat(
+        Stream.fromIterable([LLMEvent.stepStart({ index: 0 }), hostedCall("pending-at-defect", "Effect")]),
+        Stream.fromEffect(Effect.die(new Error("decoder defect"))),
+      ),
+    )
+    expect(Exit.isFailure(yield* s.resume.pipe(Effect.exit))).toBe(true)
+    expect(s.requests).toHaveLength(1)
+    const assistant = requireAssistant(yield* s.context)
+    expect(assistant).toMatchObject({
+      error: { type: "unknown", message: "decoder defect" },
+      content: [{ id: "pending-at-defect", state: { status: "error", error: { type: "unknown" } } }],
+    })
+    expect(assistant.time.completed).toBeDefined()
+    const events = yield* recordedStepSettlementEvents(sessionID, assistant.id)
+    expect(events.filter((event) => event.data.id === "pending-at-defect").map((event) => event.type)).toEqual([
+      "session.tool.called.1",
+      "session.tool.failed.2",
+    ])
+    expect(events.filter((event) => event.type === "session.step.failed.1")).toHaveLength(1)
+    const exported = yield* transfer.export({ sessionID })
+    yield* replaySessionProjection(sessionID)
+    expect((yield* transfer.export({ sessionID })).messages).toEqual(exported.messages)
+  })
+
+  for (const boundary of ["cancellation", "preparation failure", "provider change"] as const)
+    scenario(`settles deferred Anthropic tools after ${boundary}`, function* (s) {
+      s.currentModel = LanguageModel.make({
+        id: "claude-opus-5",
+        provider: "anthropic",
+        route: AnthropicMessages.route,
+      })
+      yield* s.bus.publish(SessionEvent.ModelSelected, {
+        sessionID,
+        model: { id: ID.make("claude-opus-5"), providerID: Provider.ID.make("anthropic") },
+      })
+      yield* s.admit("Search and echo")
+      const entered = yield* Deferred.make<void>()
+      yield* s.llm.push(
+        Stream.concat(
+          Stream.fromIterable([
+            LLMEvent.stepStart({ index: 0 }),
+            hostedCall("aborted-deferred", "Effect"),
+            LLMEvent.toolCall({ id: "echo-first", name: "echo", input: { text: "first" } }),
+            LLMEvent.stepFinish({ index: 0, reason: { normalized: "tool-calls", raw: "tool_use" } }),
+          ]),
+          Stream.fromEffect(
+            Effect.sync(() => {
+              if (boundary === "preparation failure") s.modelResolveHook = Effect.die("preparation failed")
+              if (boundary === "provider change") s.currentModel = model
+            }),
+          ).pipe(Stream.flatMap(() => Stream.empty)),
+        ),
+        boundary === "provider change"
+          ? TestLLM.text("Done", "changed")
+          : Stream.fromEffect(Deferred.succeed(entered, undefined)).pipe(Stream.flatMap(() => Stream.never)),
+      )
+      if (boundary === "preparation failure") {
+        expect(Exit.isFailure(yield* Effect.exit(s.resume))).toBe(true)
+      }
+      if (boundary === "provider change") yield* s.resume
+      if (boundary === "cancellation") {
+        const run = yield* s.resume.pipe(Effect.forkChild)
+        yield* Deferred.await(entered)
+        yield* s.session.interrupt(sessionID)
+        yield* Fiber.await(run)
+      }
+      const assistant = (yield* s.context).find((message) => message.type === "assistant")!
+      expect(assistant).toMatchObject({
+        content: [
+          { id: "aborted-deferred", state: { status: "error", error: { type: "aborted" } } },
+          { id: "echo-first", state: { status: "completed" } },
+        ],
+      })
+      const events = yield* recordedStepSettlementEvents(sessionID, assistant.id)
+      expect(events.filter((event) => event.data.id === "aborted-deferred").map((event) => event.type)).toEqual([
+        "session.tool.called.1",
+        "session.tool.failed.2",
+      ])
+    })
 
   scenario("starts recorded local tools eagerly and awaits settlement before continuing", function* (s) {
     yield* s.admit("Echo five times")
@@ -5012,6 +5516,34 @@ describe("SessionRunnerLLM", () => {
         content: [Expected.text("Complete")],
       },
     ])
+  })
+
+  scenario("persists Gemini finish metadata without a text block through projection replay", function* (s) {
+    s.currentModel = LanguageModel.make({ id: "gemini-2.5-flash", provider: "google", route: Gemini.route })
+    const providerState = {
+      groundingMetadata: {
+        webSearchQueries: ["Effect"],
+        groundingChunks: [{ web: { uri: "https://example.test/source", title: "Effect" } }],
+      },
+      citationMetadata: { citationSources: [{ uri: "https://example.test/source" }] },
+    }
+    yield* s.llm.push(
+      TestLLM.complete({
+        reason: { normalized: "stop", raw: "STOP" },
+        providerMetadata: { google: providerState },
+      }),
+    )
+    yield* s.runPrompt("Keep grounding without text")
+
+    const assistant = requireAssistant(yield* s.context)
+    expect(assistant).toMatchObject({ finish: "stop", rawFinish: "STOP", providerState, content: [] })
+    const events = yield* recordedStepSettlementEvents(sessionID, assistant.id)
+    expect(events.filter((event) => event.type === "session.step.ended.1")).toMatchObject([
+      { data: { assistantMessageID: assistant.id, providerState } },
+    ])
+    expect(yield* recordedEventTypes(sessionID)).not.toContain("session.text.ended.1")
+    yield* replaySessionProjection(sessionID)
+    expect(requireAssistant(yield* s.context)).toEqual(assistant)
   })
 
   scenario("projects content-filter finishes as visible terminal failures", function* (s) {

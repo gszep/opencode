@@ -30,11 +30,16 @@ export class ImportConflictError extends Schema.TaggedError<ImportConflictError>
   { sessionID: Session.ID },
 ) {}
 
+export class UnsettledError extends Schema.TaggedError<UnsettledError>()("SessionTransfer.UnsettledError", {
+  sessionID: Session.ID,
+  messageID: SessionMessage.ID,
+}) {}
+
 export interface Interface {
   readonly export: (input: {
     sessionID: Session.ID
     sanitize?: boolean
-  }) => Effect.Effect<Data, Session.NotFoundError | Session.MessageDecodeError>
+  }) => Effect.Effect<Data, Session.NotFoundError | Session.MessageDecodeError | UnsettledError>
   readonly import: (input: {
     data: Data
     location: Location.Ref
@@ -57,8 +62,12 @@ const layer = Layer.effect(
       export: Effect.fn("SessionTransfer.export")(function* (input) {
         const data = {
           info: yield* sessions.get(input.sessionID),
-          messages: (yield* sessions.messages({ sessionID: input.sessionID, order: "asc" })).filter(isSettled),
+          messages: yield* sessions.messages({ sessionID: input.sessionID, order: "asc" }),
         }
+        // Dropping individual mutable records lets later messages cross the gap;
+        // inserting the settled record afterward breaks an append-only prefix.
+        const unsettled = data.messages.find((message) => !isSettled(message))
+        if (unsettled) return yield* new UnsettledError({ sessionID: input.sessionID, messageID: unsettled.id })
         return input.sanitize ? sanitize(data) : data
       }),
       import: Effect.fn("SessionTransfer.import")(function* (input) {
@@ -163,7 +172,13 @@ export const node = makeGlobalNode({
 })
 
 function isSettled(message: SessionMessage.Info) {
-  if (message.type === "assistant") return message.time.completed !== undefined
+  if (message.type === "assistant")
+    return (
+      message.time.completed !== undefined &&
+      !message.content.some(
+        (part) => part.type === "tool" && (part.state.status === "streaming" || part.state.status === "running"),
+      )
+    )
   if (message.type === "shell" || message.type === "compaction") return message.status !== "running"
   return true
 }

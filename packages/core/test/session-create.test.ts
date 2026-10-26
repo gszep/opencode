@@ -809,9 +809,10 @@ describe("Session.create", () => {
       const session = yield* Session.Service
       const parent = yield* session.create({ location })
 
-      expect(
-        yield* session.fork({ sessionID: parent.id }).pipe(Effect.flip),
-      ).toMatchObject({ _tag: "Session.ForkEmptyError", sessionID: parent.id })
+      expect(yield* session.fork({ sessionID: parent.id }).pipe(Effect.flip)).toMatchObject({
+        _tag: "Session.ForkEmptyError",
+        sessionID: parent.id,
+      })
     }),
   )
 
@@ -1238,7 +1239,7 @@ describe("Session.create", () => {
 })
 
 describe("SessionTransfer", () => {
-  it.effect("exports only settled projected messages", () =>
+  it.effect("rejects an export containing unsettled projected messages", () =>
     Effect.gen(function* () {
       const session = yield* Session.Service
       const transfer = yield* SessionTransfer.Service
@@ -1273,9 +1274,92 @@ describe("SessionTransfer", () => {
         recent: "pending",
       })
 
-      expect((yield* transfer.export({ sessionID: source.id })).messages).toMatchObject([Expected.user("Settled")])
+      expect(yield* transfer.export({ sessionID: source.id }).pipe(Effect.flip)).toMatchObject({
+        _tag: "SessionTransfer.UnsettledError",
+        sessionID: source.id,
+      })
     }),
   )
+
+  for (const status of ["running", "streaming"] as const)
+    for (const sanitize of [false, true])
+      it.effect(`rejects ${status} hosted tools after step completion, sanitize=${sanitize}`, () =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const transfer = yield* SessionTransfer.Service
+          const bus = yield* Bus.Service
+          const { db } = yield* Database.Service
+          const source = yield* session.create({ location })
+          yield* session.prompt({ sessionID: source.id, text: "Before", resume: false })
+          yield* SessionInbox.promote(db, bus, source.id, "steer")
+          const initial = yield* transfer.export({ sessionID: source.id, sanitize })
+          const assistantMessageID = SessionMessage.ID.create()
+          yield* bus.publish(SessionEvent.Step.Started, {
+            sessionID: source.id,
+            assistantMessageID,
+            agent: Agent.ID.make("build"),
+            model: Model.Ref.make({ id: Model.ID.make("model"), providerID: Provider.ID.anthropic }),
+            started: 0,
+          })
+          yield* bus.publish(SessionEvent.Tool.Input.Started, {
+            sessionID: source.id,
+            assistantMessageID,
+            id: "srvtoolu_export",
+            name: "web_search",
+          })
+          if (status === "running")
+            yield* bus.publish(SessionEvent.Tool.Called, {
+              sessionID: source.id,
+              assistantMessageID,
+              id: "srvtoolu_export",
+              input: { query: "official documentation" },
+              executed: true,
+            })
+          yield* bus.publish(SessionEvent.Step.Ended, {
+            sessionID: source.id,
+            assistantMessageID,
+            finish: "tool-calls",
+            rawFinish: "tool_use",
+            cost: Money.USD.zero,
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          })
+          expect(yield* transfer.export({ sessionID: source.id, sanitize }).pipe(Effect.flip)).toMatchObject({
+            _tag: "SessionTransfer.UnsettledError",
+            sessionID: source.id,
+            messageID: assistantMessageID,
+          })
+          // A later delivered record must not cross the unfinished assistant.
+          yield* session.prompt({ sessionID: source.id, text: "After", resume: false })
+          yield* SessionInbox.promote(db, bus, source.id, "steer")
+          expect(yield* transfer.export({ sessionID: source.id, sanitize }).pipe(Effect.flip)).toMatchObject({
+            _tag: "SessionTransfer.UnsettledError",
+            messageID: assistantMessageID,
+          })
+          if (status === "streaming")
+            yield* bus.publish(SessionEvent.Tool.Called, {
+              sessionID: source.id,
+              assistantMessageID,
+              id: "srvtoolu_export",
+              input: { query: "official documentation" },
+              executed: true,
+            })
+          yield* bus.publish(SessionEvent.Tool.Success, {
+            sessionID: source.id,
+            assistantMessageID,
+            id: "srvtoolu_export",
+            content: [{ type: "text", text: "Found later" }],
+            executed: true,
+          })
+          const settled = yield* transfer.export({ sessionID: source.id, sanitize })
+          expect(settled.messages.slice(0, initial.messages.length)).toEqual([...initial.messages])
+          expect(settled.messages.map((message) => message.type)).toEqual(["user", "assistant", "user"])
+          expect(settled.messages[1]).toMatchObject({
+            id: assistantMessageID,
+            content: [{ type: "tool", state: { status: "completed" } }],
+          })
+          expect(yield* transfer.export({ sessionID: source.id, sanitize })).toEqual(settled)
+        }),
+      )
 
   it.effect("imports only settled projected messages", () =>
     Effect.gen(function* () {
